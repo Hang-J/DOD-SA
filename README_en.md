@@ -1,6 +1,6 @@
 # DOD-SA
 
-English | [Chinese](README.md)
+English | [Chinese](./README_zh.md)
 
 A PaddleDetection-based implementation of DA-DPDETR for paired VIS/IR object detection and domain-adaptive training. This document merges two variants:
 
