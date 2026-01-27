@@ -1,0 +1,13 @@
+README.md
+setup.py
+/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/matched_rbox_iou/matched_rbox_iou.cc
+/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/matched_rbox_iou/matched_rbox_iou.cu
+/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/nms_rotated/nms_rotated.cc
+/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/nms_rotated/nms_rotated.cu
+/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/rbox_iou/rbox_iou.cc
+/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/rbox_iou/rbox_iou.cu
+ext_op.egg-info/PKG-INFO
+ext_op.egg-info/SOURCES.txt
+ext_op.egg-info/dependency_links.txt
+ext_op.egg-info/not-zip-safe
+ext_op.egg-info/top_level.txt

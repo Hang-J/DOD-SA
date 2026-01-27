@@ -1,0 +1,79 @@
+worker_num: 4
+
+TrainReader:
+  sample_transforms:
+    - Multi_Decode: {}
+    - Multi_RandomDistort: {prob: 0.8}
+    - Multi_RandomExpand_IRVIS_Paired: {fill_value: [123.675, 116.28, 103.53], fill_value_ir: [114.495, 114.495, 114.495]}
+    - Multi_RandomCrop_Paired: {prob: 0.8}
+    - Multi_RandomFlip_Paired: {}
+    # strong_aug
+    - RandomColorJitter_DAOD: { prob: 0.8, brightness: 0.4, contrast: 0.4, saturation: 0.4, hue: 0.1 }
+    - RandomErasingCrop_DAOD: { }
+    - RandomGaussianBlur_DAOD: { prob: 0.5, sigma: [ 0.1, 2.0 ] }
+    - RandomGrayscale_DAOD: { prob: 0.2 }
+
+    # flip for pesudo labels
+    #- Flip_DAOD: {}  #这个实际没用到，而且这个翻转处理在kaist数据集中是错误的，我懒得改了
+
+  batch_transforms:
+    - Multi_BatchRandomResize_Paired: {target_size: [480, 512, 544, 576, 608, 640, 640, 640, 672, 704, 736, 768, 800], random_size: True, random_interp: True, keep_ratio: False}
+    #- Multi_BatchRandomResize_Paired: {target_size: 640, random_size: False, random_interp: True, keep_ratio: True}
+    - Multi_NormalizeImage_DAOD: {mean: [0., 0., 0.], std: [1., 1., 1.], norm_type: none}
+    #- Multi_NormalizeImage_DAOD: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225], is_scale: True}
+    - Multi_NormalizeBox_Paired: {}
+    - BboxXYXY2XYWH_Paired: {}
+    - Multi_Permute_DAOD: {}
+    #- PadRGT_Paired_DAOD: {}
+    #- Multi_PadBatch_DAOD: {pad_to_stride: 32}
+
+  batch_size: 4
+  shuffle: true
+  drop_last: false
+  use_shared_memory: false
+  collate_batch: false
+
+EvalReader:
+  sample_transforms:
+    - Multi_Decode: {}
+    #- Multi_Resize: {target_size: 640, keep_ratio: True, interp: 2}
+    - Multi_Resize: {target_size: [640, 640], keep_ratio: False, interp: 2}
+    - Multi_NormalizeImage: {mean: [0., 0., 0.], std: [1., 1., 1.], norm_type: none}
+    #- Multi_NormalizeImage: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225], is_scale: True}
+    - Multi_Permute: {}
+    #- BBox2RBox: {}
+  batch_transforms:
+    - Multi_PadBatch: {pad_to_stride: 32}
+  batch_size: 4
+  shuffle: false
+  drop_last: false
+  collate_batch: false
+
+# EvalReader2:
+#   sample_transforms: 
+#     - Multi_Decode: {}
+#     - Multi_Resize_Paired: {target_size: [640, 640], keep_ratio: False, interp: 2}
+#     - Multi_NormalizeImage: {mean: [0., 0., 0.], std: [1., 1., 1.], norm_type: none}
+#     #- Multi_NormalizeImage: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225], is_scale: True}
+#     - Multi_Permute: {}
+#     #- BBox2RBox: {}
+#   # batch_transforms:
+#   #   - Multi_PadBatch: {pad_to_stride: 32}
+#   batch_size: 4
+#   shuffle: false
+#   drop_last: false
+#   collate_batch: false
+  
+TestReader:
+  inputs_def:
+    image_shape: [3, 640, 640]
+  sample_transforms:
+    - Multi_Decode: {}
+    - Multi_Resize: {target_size: [640, 640], keep_ratio: False, interp: 2}
+    - Multi_NormalizeImage: {mean: [0., 0., 0.], std: [1., 1., 1.], norm_type: none}
+    # - Multi_NormalizeImage: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225], is_scale: True}
+    - Multi_Permute: {}
+  batch_size: 1
+  shuffle: false
+  drop_last: false
+  collate_batch: false

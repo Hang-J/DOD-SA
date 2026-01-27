@@ -1,0 +1,40 @@
+_BASE_: [
+  '../datasets/coco_detection_kaist_paired.yml',
+  #'../datasets/rbox_detection_drone-vechal_DAOD_paired_DAOD.yml',
+  '../runtime_kaist.yml',
+  '_base_/optimizer_6x.yml',
+  '_base_/damsdet_r_paired_DAOD_r50vd.yml',
+  '_base_/rtdetr_r_DAOD_kaist_reader.yml',
+]
+
+# Stage 1
+ema_start_epochs: 7 #7
+semi_start_epochs: 7 #7
+# Stage 2
+stage2_start_epochs: 13 #13
+
+# Stage 3
+stage3_start_epochs: 25 #25
+
+use_simple_ema: True
+ema_decay: 0.9999
+
+sup_weight: 1.0
+
+psudo_label_threhold: 0.6
+
+train_cfg:
+  sup_weight: 1.0
+  unsup_weight: 1.0
+  loss_weight: {distill_loss_cls: 2.0, distill_loss_box: 1.0, distill_loss_quality: 1.0}
+  concat_sup_data: True
+  suppress: linear
+  ratio: 0.01
+  gamma: 2.0
+
+test_cfg:
+  inference_on: teacher
+
+#weights: output/output13/kaist/model_final
+find_unused_parameters: True
+log_iter: 200

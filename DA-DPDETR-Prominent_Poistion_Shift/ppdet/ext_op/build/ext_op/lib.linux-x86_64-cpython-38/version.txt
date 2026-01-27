@@ -1,0 +1,43 @@
+{
+    "define_macros": [],
+    "ext_op.so": "1799df8ef51b22fe40857718d754a549",
+    "extra_compile_args": {
+        "cxx": [
+            "-DPADDLE_WITH_CUDA",
+            "-w",
+            "-DPADDLE_WITH_CUSTOM_KERNEL"
+        ],
+        "nvcc": [
+            "-w",
+            "-DPADDLE_WITH_CUSTOM_KERNEL"
+        ]
+    },
+    "extra_link_args": [
+        "-l:libpaddle.so",
+        "-lcudart"
+    ],
+    "include_dirs": [
+        "/data1/guojunjie1/anaconda3/envs/pp_detection/lib/python3.8/site-packages/paddle/include",
+        "/data1/guojunjie1/anaconda3/envs/pp_detection/lib/python3.8/site-packages/paddle/include/third_party",
+        "/usr/local/cuda/include"
+    ],
+    "library_dirs": [
+        "/data1/guojunjie1/anaconda3/envs/pp_detection/lib/python3.8/site-packages/paddle/libs",
+        "/usr/local/cuda/lib64",
+        "/data1/guojunjie1/anaconda3/envs/pp_detection/lib/python3.8/site-packages/paddle/fluid"
+    ],
+    "runtime_library_dirs": [
+        "/data1/guojunjie1/anaconda3/envs/pp_detection/lib/python3.8/site-packages/paddle/libs",
+        "/usr/local/cuda/lib64",
+        "/data1/guojunjie1/anaconda3/envs/pp_detection/lib/python3.8/site-packages/paddle/fluid"
+    ],
+    "sources": [
+        "/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/matched_rbox_iou/matched_rbox_iou.cc",
+        "/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/matched_rbox_iou/matched_rbox_iou.cu",
+        "/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/rbox_iou/rbox_iou.cc",
+        "/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/rbox_iou/rbox_iou.cu",
+        "/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/nms_rotated/nms_rotated.cc",
+        "/data1/guojunjie1/python_project/MS-PaddleDetection-develop-240117/ppdet/ext_op/csrc/nms_rotated/nms_rotated.cu"
+    ],
+    "undef_macros": []
+}

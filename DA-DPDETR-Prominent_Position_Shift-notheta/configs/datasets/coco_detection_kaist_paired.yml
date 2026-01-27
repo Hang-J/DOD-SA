@@ -1,0 +1,118 @@
+# metric: COCO
+# num_classes: 1
+# TrainDataset:
+#   !Mutisprctral_COCODataSet_Paired
+#     vis_image_dir: train_imgs/vis
+#     ir_image_dir : train_imgs/ir
+#     anno_path_vis: coco_annotations/train_vis_nounpaired.json
+#     anno_path_ir: coco_annotations/train_ir_nounpaired.json
+#     dataset_dir: /data1/jinhang/Datasets/kaist-paired
+#     data_fields: ['image', 'gt_bbox_vis','gt_bbox_ir', 'gt_class', 'is_crowd']
+#     allow_empty: true
+
+# EvalDataset:
+#   !Mutisprctral_COCODataSet
+#     vis_image_dir: val_imgs/vis
+#     ir_image_dir: val_imgs/ir
+#     anno_path: coco_annotations/val.json
+#     dataset_dir: /data1/jinhang/Datasets/kaist-paired
+#     #data_fields: ['image', 'gt_bbox', 'gt_class', 'is_crowd']
+#     allow_empty: true
+
+# TestDataset:
+#   !Multi_ImageFolder
+#     anno_path: coco_annotations/label_list.txt # also support txt (like VOC's label_list.txt)
+#     dataset_dir: /data1/jinhang/Datasets/kaist-paired # if set, anno_path will be 'dataset_dir/anno_path'
+##########################################
+#红外-可见光互换
+##########################################
+# TrainDataset:
+#   !Mutisprctral_COCODataSet_Paired
+#     vis_image_dir: train_imgs/ir
+#     ir_image_dir : train_imgs/vis
+#     anno_path_vis: coco_annotations/train_ir_nounpaired.json
+#     anno_path_ir: coco_annotations/train_vis_nounpaired.json
+#     dataset_dir: /data1/jinhang/Datasets/kaist-paired
+#     data_fields: ['image', 'gt_bbox_vis','gt_bbox_ir', 'gt_class', 'is_crowd']
+#     allow_empty: true
+
+# EvalDataset:
+#   !Mutisprctral_COCODataSet
+#     vis_image_dir: val_imgs/ir
+#     ir_image_dir: val_imgs/vis
+#     anno_path: coco_annotations/val_vis_nounpaired.json
+#     dataset_dir: /data1/jinhang/Datasets/kaist-paired
+#     data_fields: ['image', 'gt_bbox', 'gt_class', 'is_crowd']
+#     allow_empty: true
+
+# TestDataset:
+#   !Multi_ImageFolder
+#     anno_path: coco_annotations/label_list.txt # also support txt (like VOC's label_list.txt)
+#     dataset_dir: /data1/jinhang/Datasets/kaist-paired # if set, anno_path will be 'dataset_dir/anno_path'
+
+##########################################
+# FLIR数据集格式
+##########################################
+# metric: COCO
+# num_classes: 3
+# TrainDataset:
+#   !Mutisprctral_COCODataSet_Paired
+#     vis_image_dir: FLIR-image/vi-train
+#     ir_image_dir : FLIR-image/ir-train
+#     anno_path_vis: train_ir.json
+#     anno_path_ir: train_ir.json
+#     dataset_dir: /data1/jinhang/Datasets/FLIR_Zhang
+#     data_fields: ['image', 'gt_bbox_vis','gt_bbox_ir', 'gt_class', 'is_crowd']
+#     allow_empty: false
+
+# EvalDataset:
+#   !Mutisprctral_COCODataSet
+#     vis_image_dir: FLIR-image/vi-test
+#     ir_image_dir: FLIR-image/ir-test
+#     anno_path: val_ir.json
+#     dataset_dir: /data1/jinhang/Datasets/FLIR_Zhang
+#     #data_fields: ['image', 'gt_bbox', 'gt_class', 'is_crowd']
+#     allow_empty: false
+
+# TestDataset:
+#   !Multi_ImageFolder
+#     anno_path: label_list.txt # also support txt (like VOC's label_list.txt)
+#     dataset_dir: /data1/jinhang/Datasets/FLIR_Zhang # if set, anno_path will be 'dataset_dir/anno_path'
+##########################################
+# CVC-14数据集格式
+##########################################
+metric: COCO
+num_classes: 1
+TrainDataset:
+  !Mutisprctral_COCODataSet_Paired
+    vis_image_dir: train_DeformCAT/ir/images
+    ir_image_dir : train_DeformCAT/vis/images
+    anno_path_vis: train_ir_coco_paired.json
+    anno_path_ir: train_vis_coco_paired.json
+    dataset_dir: /data1/jinhang/Datasets/CVC-14
+    data_fields: ['image', 'gt_bbox_vis','gt_bbox_ir', 'gt_class', 'is_crowd']
+    allow_empty: true
+
+EvalDataset:
+  !Mutisprctral_COCODataSet
+    vis_image_dir: val_DeformCAT/ir/images
+    ir_image_dir: val_DeformCAT/vis/images
+    anno_path: val_ir_coco_paired.json
+    dataset_dir: /data1/jinhang/Datasets/CVC-14
+    #data_fields: ['image', 'gt_bbox', 'gt_class', 'is_crowd']
+    allow_empty: true
+
+# EvalDataset2:
+#   !Mutisprctral_COCODataSet_Paired
+#     vis_image_dir: val_DeformCAT/ir/images
+#     ir_image_dir: val_DeformCAT/vis/images
+#     anno_path_vis: val_ir_coco_paired.json
+#     anno_path_ir: val_vis_coco_paired.json
+#     dataset_dir: /data1/jinhang/Datasets/CVC-14
+#     data_fields: ['image', 'gt_bbox_vis','gt_bbox_ir', 'gt_class', 'is_crowd']
+#     allow_empty: true
+
+TestDataset:
+  !Multi_ImageFolder
+    anno_path: label_list.txt # also support txt (like VOC's label_list.txt)
+    dataset_dir: /data1/jinhang/Datasets/CVC-14 # if set, anno_path will be 'dataset_dir/anno_path'

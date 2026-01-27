@@ -1,0 +1,74 @@
+worker_num: 8
+image_height: &image_height 640
+image_width: &image_width 640
+image_size: &image_size [*image_height, *image_width]
+
+TrainReader:
+  sample_transforms:
+    - Multi_Decode: {}
+    - Poly2Array_Paired: {}
+    - Multi_RandomRFlip_Paired: {}
+    # - RandomRRotate: {angle_mode: 'value', angle: [0, 90, 180, -90]}
+    # - RandomRRotate: {angle_mode: 'value', angle: [30, 60], rotate_prob: 0.5}
+    - Multi_RandomRRotate_Paired: {angle_mode: 'value', angle: [0, 90, 180, -90]}
+    - Multi_RandomRRotate_Paired: {angle_mode: 'value', angle: [30, 60], rotate_prob: 0.5}
+    - Multi_RResize_Paired: {target_size: *image_size, keep_ratio: True, interp: 2}
+    - Poly2RBox_Paired: {filter_threshold: 2, filter_mode: 'edge', rbox_type: 'oc'}
+
+    # strong_aug
+    - RandomColorJitter_DAOD: { prob: 0.8, brightness: 0.4, contrast: 0.4, saturation: 0.4, hue: 0.1 }
+    - RandomErasingCrop_DAOD: { }
+    - RandomGaussianBlur_DAOD: { prob: 0.5, sigma: [ 0.1, 2.0 ] }
+    - RandomGrayscale_DAOD: { prob: 0.2 }
+
+    # flip for pesudo labels
+    - Flip_DAOD: {}
+
+  batch_transforms:
+    - Multi_NormalizeImage_DAOD: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225], is_scale: True}
+    - Multi_Permute_DAOD: {} #改变图像数据的维度顺序，HWC到CHW
+    - PadRGT_Paired_DAOD: {} #对一个批次内的GT进行填充对齐
+    - Multi_PadBatch_DAOD: {pad_to_stride: 32} #对批次中的多个图像进行填充，使其尺寸能够被指定的步长（stride=32）整除
+
+  batch_size: 4
+  shuffle: true
+  drop_last: false
+  use_shared_memory: true
+  collate_batch: true
+
+EvalReader2:
+  sample_transforms: 
+    - Multi_Decode: {}
+    - Poly2Array_Paired: {}
+    - Eval_Shift_VIS: {decision: 4, pix1: 0, pix2: 0}
+    - Multi_RResize_Paired: {target_size: *image_size, keep_ratio: True, interp: 2}
+    - Multi_NormalizeImage: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225], is_scale: True}
+    - Multi_Permute: {}
+    #上  下  左  右  上左  上右  下左  下右
+    #0   1   2   3    4    5     6     7
+  batch_transforms:
+    - Multi_PadBatch: {pad_to_stride: 32}
+  batch_size: 4
+  collate_batch: false
+
+EvalReader:
+  sample_transforms:
+    - Multi_Decode: {}
+    - Poly2Array: {}
+    - Multi_RResize: {target_size: *image_size, keep_ratio: True, interp: 2}
+    - Multi_NormalizeImage: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225], is_scale: True}
+    - Multi_Permute: {}
+  batch_transforms:
+    - Multi_PadBatch: {pad_to_stride: 32}
+  batch_size: 4
+  collate_batch: false
+
+TestReader:
+  sample_transforms:
+    - Multi_Decode: {}
+    - Multi_Resize: {target_size: *image_size, keep_ratio: True, interp: 2}
+    - Multi_NormalizeImage: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225], is_scale: True}
+    - Multi_Permute: {}
+  batch_transforms:
+    - Multi_PadBatch: {pad_to_stride: 32}
+  batch_size: 1

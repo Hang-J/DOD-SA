@@ -1,0 +1,2667 @@
+# Copyright (c) 2020 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import os
+import sys
+import copy
+import time
+from tqdm import tqdm
+from PIL import Image, ImageDraw
+import numpy as np
+import typing
+from PIL import Image, ImageOps, ImageFile
+import copy
+import math
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+    
+from scipy.optimize import linear_sum_assignment
+import paddle
+import paddle.nn as nn
+import paddle.distributed as dist
+from paddle.distributed import fleet
+from paddle.static import InputSpec
+from ppdet.optimizer import ModelEMA_v3, SimpleModelEMA
+
+from ppdet.core.workspace import create
+from ppdet.utils.checkpoint import load_weight, load_pretrain_weight
+from ppdet.utils.visualizer import visualize_results, save_result, visualize_results_paired
+from ppdet.metrics import Metric, COCOMetric, VOCMetric, WiderFaceMetric, get_infer_results
+from ppdet.metrics import RBoxMetric, SNIPERCOCOMetric
+from ppdet.data.source.sniper_coco import SniperCOCODataSet
+from ppdet.data.source.category import get_categories
+import ppdet.utils.stats as stats
+from ppdet.utils.fuse_utils import fuse_conv_bn
+from ppdet.utils import profiler
+from ppdet.modeling.post_process import multiclass_nms
+
+from .callbacks import Callback, ComposeCallback, LogPrinter, Checkpointer, WiferFaceEval, VisualDLWriter, SniperProposalsGenerator, WandbCallback
+from .export_utils import _dump_infer_config, _prune_input_spec, apply_to_static
+
+from paddle.distributed.fleet.utils.hybrid_parallel_util import fused_allreduce_gradients
+
+from ..modeling.losses.probiou_loss import ProbIoULoss
+import cv2
+
+from ppdet.utils.logger import setup_logger
+logger = setup_logger('ppdet.engine')
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+__all__ = ['Trainer_DAOD_no_flip_supression']
+
+MOT_ARCH = ['JDE', 'FairMOT', 'DeepSORT', 'ByteTrack', 'CenterTrack']
+
+
+class Trainer_DAOD_no_flip_supression(object):
+    def __init__(self, cfg, mode='train'):
+        self.cfg = cfg.copy()
+        assert mode.lower() in ['train', 'eval', 'test'], \
+                "mode should be 'train', 'eval' or 'test'"
+        self.mode = mode.lower()
+        self.optimizer = None
+        self.is_loaded_weights = False
+        self.use_amp = self.cfg.get('amp', False)
+        self.amp_level = self.cfg.get('amp_level', 'O1')
+        self.custom_white_list = self.cfg.get('custom_white_list', None)
+        self.custom_black_list = self.cfg.get('custom_black_list', None)
+        if 'slim' in cfg and cfg['slim_type'] == 'PTQ':
+            self.cfg['TestDataset'] = create('TestDataset')()
+
+        # build data loader
+        capital_mode = self.mode.capitalize()
+        if cfg.architecture in MOT_ARCH and self.mode in [
+                'eval', 'test'
+        ] and cfg.metric not in ['COCO', 'VOC']:
+            self.dataset = self.cfg['{}MOTDataset'.format(
+                capital_mode)] = create('{}MOTDataset'.format(capital_mode))()
+        else:
+            self.dataset = self.cfg['{}Dataset'.format(capital_mode)] = create(
+                '{}Dataset'.format(capital_mode))()
+
+        if cfg.architecture == 'DeepSORT' and self.mode == 'train':
+            logger.error('DeepSORT has no need of training on mot dataset.')
+            sys.exit(1)
+
+        if cfg.architecture == 'FairMOT' and self.mode == 'eval':
+            images = self.parse_mot_images(cfg)
+            self.dataset.set_images(images)
+
+        if self.mode == 'train':
+            self.loader = create('{}Reader'.format(capital_mode))(
+                self.dataset, cfg.worker_num)
+
+        if cfg.architecture == 'JDE' and self.mode == 'train':
+            self.cfg['JDEEmbeddingHead'][
+                'num_identities'] = self.dataset.num_identities_dict[0]
+            # JDE only support single class MOT now.
+
+        if cfg.architecture == 'FairMOT' and self.mode == 'train':
+            self.cfg['FairMOTEmbeddingHead'][
+                'num_identities_dict'] = self.dataset.num_identities_dict
+            # FairMOT support single class and multi-class MOT now.
+
+        # build model
+        if 'model' not in self.cfg:
+            self.model = create(cfg.architecture)
+
+            #conduct flops
+            #paddle.flops(self.model, input_size=[1,3,640,640],print_detail=True)
+        else:
+            self.model = self.cfg.model
+            self.is_loaded_weights = True
+
+        if cfg.architecture == 'YOLOX':
+            for k, m in self.model.named_sublayers():
+                if isinstance(m, nn.BatchNorm2D):
+                    m._epsilon = 1e-3  # for amp(fp16)
+                    m._momentum = 0.97  # 0.03 in pytorch
+
+        #normalize params for deploy
+        if 'slim' in cfg and cfg['slim_type'] == 'OFA':
+            self.model.model.load_meanstd(cfg['TestReader'][
+                'sample_transforms'])
+        elif 'slim' in cfg and cfg['slim_type'] == 'Distill':
+            self.model.student_model.load_meanstd(cfg['TestReader'][
+                'sample_transforms'])
+        elif 'slim' in cfg and cfg[
+                'slim_type'] == 'DistillPrune' and self.mode == 'train':
+            self.model.student_model.load_meanstd(cfg['TestReader'][
+                'sample_transforms'])
+        else:
+            self.model.load_meanstd(cfg['TestReader']['sample_transforms'])
+
+        # EvalDataset build with BatchSampler to evaluate in single device
+        # TODO: multi-device evaluate
+        if self.mode == 'eval':
+            if cfg.architecture == 'FairMOT':
+                self.loader = create('EvalMOTReader')(self.dataset, 0)
+            elif cfg.architecture == "METRO_Body":
+                reader_name = '{}Reader'.format(self.mode.capitalize())
+                self.loader = create(reader_name)(self.dataset, cfg.worker_num)
+            else:
+                self._eval_batch_sampler = paddle.io.BatchSampler(
+                    self.dataset, batch_size=self.cfg.EvalReader['batch_size'])
+                reader_name = '{}Reader'.format(self.mode.capitalize())
+                # If metric is VOC, need to be set collate_batch=False.
+                if cfg.metric == 'VOC':
+                    self.cfg[reader_name]['collate_batch'] = False
+                self.loader = create(reader_name)(self.dataset, cfg.worker_num,
+                                                  self._eval_batch_sampler)
+        # TestDataset build after user set images, skip loader creation here
+
+        # get Params
+        print_params = self.cfg.get('print_params', False)
+        if print_params:
+            params = sum([
+                p.numel() for n, p in self.model.named_parameters()
+                if all([x not in n for x in ['_mean', '_variance', 'aux_']])
+            ])  # exclude BatchNorm running status
+            logger.info(
+                'Model Params : {} M.'.format(float(params / 1e6)))
+
+        # build optimizer in train mode
+        if self.mode == 'train':
+            steps_per_epoch = len(self.loader)
+            if steps_per_epoch < 1:
+                logger.warning(
+                    "Samples in dataset are less than batch_size, please set smaller batch_size in TrainReader."
+                )
+            self.lr = create('LearningRate')(steps_per_epoch)
+            self.optimizer = create('OptimizerBuilder')(self.lr, self.model)
+
+            # Unstructured pruner is only enabled in the train mode.
+            if self.cfg.get('unstructured_prune'):
+                self.pruner = create('UnstructuredPruner')(self.model,
+                                                           steps_per_epoch)
+        if self.use_amp and self.amp_level == 'O2':
+            self.model, self.optimizer = paddle.amp.decorate(
+                models=self.model,
+                optimizers=self.optimizer,
+                level=self.amp_level)
+        self.use_ema = ('use_ema' in cfg and cfg['use_ema'])
+        if self.use_ema:
+            ema_decay = self.cfg.get('ema_decay', 0.9998)
+            ema_decay_type = self.cfg.get('ema_decay_type', 'threshold')
+            cycle_epoch = self.cfg.get('cycle_epoch', -1)
+            ema_black_list = self.cfg.get('ema_black_list', None)
+            ema_filter_no_grad = self.cfg.get('ema_filter_no_grad', False)
+            self.ema = ModelEMA_v3(
+                self.model,
+                decay=ema_decay,
+                ema_decay_type=ema_decay_type,
+                cycle_epoch=cycle_epoch,
+                ema_black_list=ema_black_list,
+                ema_filter_no_grad=ema_filter_no_grad)
+
+        # simple_ema for SSOD
+        # self.use_simple_ema = ('use_simple_ema' in cfg and
+        #                        cfg['use_simple_ema'])
+        # if self.use_simple_ema:
+        #     self.use_ema = True
+        #     ema_decay = self.cfg.get('ema_decay', 0.9996)
+        #     self.ema = SimpleModelEMA(self.model, decay=ema_decay)
+            self.ema_start_epochs = self.cfg.get('ema_start_epochs', 0)
+
+        self._nranks = dist.get_world_size()
+        self._local_rank = dist.get_rank()
+
+        self.status = {}
+
+        self.start_epoch = 0
+        self.end_epoch = 0 if 'epoch' not in cfg else cfg.epoch
+
+        # initial default callbacks
+        self._init_callbacks()
+
+        # initial default metrics
+        self._init_metrics()
+        self._reset_metrics()
+        from pycocotools.coco import COCO
+        anno_path_vis = os.path.join(self.cfg.TrainDataset.dataset_dir, self.cfg.TrainDataset.anno_path_vis)
+        anno_path_ir = os.path.join(self.cfg.TrainDataset.dataset_dir, self.cfg.TrainDataset.anno_path_ir)
+        self.coco_vis = COCO(anno_path_vis)
+        self.coco_ir = COCO(anno_path_ir)
+
+    def _init_callbacks(self):
+        if self.mode == 'train':
+            self._callbacks = [LogPrinter(self), Checkpointer(self)]
+            if self.cfg.get('use_vdl', False):
+                self._callbacks.append(VisualDLWriter(self))
+            if self.cfg.get('save_proposals', False):
+                self._callbacks.append(SniperProposalsGenerator(self))
+            if self.cfg.get('use_wandb', False) or 'wandb' in self.cfg:
+                self._callbacks.append(WandbCallback(self))
+            self._compose_callback = ComposeCallback(self._callbacks)
+        elif self.mode == 'eval':
+            self._callbacks = [LogPrinter(self)]
+            if self.cfg.metric == 'WiderFace':
+                self._callbacks.append(WiferFaceEval(self))
+            self._compose_callback = ComposeCallback(self._callbacks)
+        elif self.mode == 'test' and self.cfg.get('use_vdl', False):
+            self._callbacks = [VisualDLWriter(self)]
+            self._compose_callback = ComposeCallback(self._callbacks)
+        else:
+            self._callbacks = []
+            self._compose_callback = None
+
+    def _init_metrics(self, validate=False):
+        if self.mode == 'test' or (self.mode == 'train' and not validate):
+            self._metrics = []
+            return
+        classwise = self.cfg['classwise'] if 'classwise' in self.cfg else False
+        if self.cfg.metric == 'COCO' or self.cfg.metric == "SNIPERCOCO":
+            # TODO: bias should be unified
+            bias = 1 if self.cfg.get('bias', False) else 0
+            output_eval = self.cfg['output_eval'] \
+                if 'output_eval' in self.cfg else None
+            save_prediction_only = self.cfg.get('save_prediction_only', False)
+
+            # pass clsid2catid info to metric instance to avoid multiple loading
+            # annotation file
+            clsid2catid = {v: k for k, v in self.dataset.catid2clsid.items()} \
+                                if self.mode == 'eval' else None
+
+            # when do validation in train, annotation file should be get from
+            # EvalReader instead of self.dataset(which is TrainReader)
+            if self.mode == 'train' and validate:
+                eval_dataset = self.cfg['EvalDataset']
+                eval_dataset.check_or_download_dataset()
+                anno_file = eval_dataset.get_anno()
+                dataset = eval_dataset
+            else:
+                dataset = self.dataset
+                anno_file = dataset.get_anno()
+
+            IouType = self.cfg['IouType'] if 'IouType' in self.cfg else 'bbox'
+            if self.cfg.metric == "COCO":
+                self._metrics = [
+                    COCOMetric(
+                        anno_file=anno_file,
+                        clsid2catid=clsid2catid,
+                        classwise=classwise,
+                        output_eval=output_eval,
+                        bias=bias,
+                        IouType=IouType,
+                        save_prediction_only=save_prediction_only)
+                ]
+            elif self.cfg.metric == "SNIPERCOCO":  # sniper
+                self._metrics = [
+                    SNIPERCOCOMetric(
+                        anno_file=anno_file,
+                        dataset=dataset,
+                        clsid2catid=clsid2catid,
+                        classwise=classwise,
+                        output_eval=output_eval,
+                        bias=bias,
+                        IouType=IouType,
+                        save_prediction_only=save_prediction_only)
+                ]
+        elif self.cfg.metric == 'RBOX':
+            # TODO: bias should be unified
+            bias = self.cfg['bias'] if 'bias' in self.cfg else 0
+            output_eval = self.cfg['output_eval'] \
+                if 'output_eval' in self.cfg else None
+            save_prediction_only = self.cfg.get('save_prediction_only', False)
+            imid2path = self.cfg.get('imid2path', None)
+
+            # when do validation in train, annotation file should be get from
+            # EvalReader instead of self.dataset(which is TrainReader)
+            anno_file = self.dataset.get_anno()
+            if self.mode == 'train' and validate:
+                eval_dataset = self.cfg['EvalDataset']
+                eval_dataset.check_or_download_dataset()
+                anno_file = eval_dataset.get_anno()
+
+            self._metrics = [
+                RBoxMetric(
+                    anno_file=anno_file,
+                    classwise=classwise,
+                    output_eval=output_eval,
+                    bias=bias,
+                    save_prediction_only=save_prediction_only,
+                    imid2path=imid2path)
+            ]
+        elif self.cfg.metric == 'VOC':
+            output_eval = self.cfg['output_eval'] \
+                if 'output_eval' in self.cfg else None
+            save_prediction_only = self.cfg.get('save_prediction_only', False)
+
+            self._metrics = [
+                VOCMetric(
+                    label_list=self.dataset.get_label_list(),
+                    class_num=self.cfg.num_classes,
+                    map_type=self.cfg.map_type,
+                    classwise=classwise,
+                    output_eval=output_eval,
+                    save_prediction_only=save_prediction_only)
+            ]
+        elif self.cfg.metric == 'WiderFace':
+            multi_scale = self.cfg.multi_scale_eval if 'multi_scale_eval' in self.cfg else True
+            self._metrics = [
+                WiderFaceMetric(
+                    image_dir=os.path.join(self.dataset.dataset_dir,
+                                           self.dataset.image_dir),
+                    anno_file=self.dataset.get_anno(),
+                    multi_scale=multi_scale)
+            ]
+        else:
+            logger.warning("Metric not support for metric type {}".format(
+                self.cfg.metric))
+            self._metrics = []
+
+    def _reset_metrics(self):
+        for metric in self._metrics:
+            metric.reset()
+
+    def register_callbacks(self, callbacks):
+        callbacks = [c for c in list(callbacks) if c is not None]
+        for c in callbacks:
+            assert isinstance(c, Callback), \
+                    "metrics shoule be instances of subclass of Metric"
+        self._callbacks.extend(callbacks)
+        self._compose_callback = ComposeCallback(self._callbacks)
+
+    def register_metrics(self, metrics):
+        metrics = [m for m in list(metrics) if m is not None]
+        for m in metrics:
+            assert isinstance(m, Metric), \
+                    "metrics shoule be instances of subclass of Metric"
+        self._metrics.extend(metrics)
+
+    def load_weights(self, weights, ARSL_eval=False):
+        if self.is_loaded_weights:
+            return
+        self.start_epoch = 0
+        load_pretrain_weight(self.model, weights, ARSL_eval, mode = 'multi_DAOD')
+        logger.debug("Load weights {} to start training".format(weights))
+
+    def load_weights_sde(self, det_weights, reid_weights):
+        if self.model.detector:
+            load_weight(self.model.detector, det_weights)
+            if self.model.reid:
+                load_weight(self.model.reid, reid_weights)
+        else:
+            load_weight(self.model.reid, reid_weights)
+
+    def resume_weights(self, weights):
+        # support Distill resume weights
+        if hasattr(self.model, 'student_model'):
+            self.start_epoch = load_weight(self.model.student_model, weights,
+                                           self.optimizer)
+        else:
+            self.start_epoch = load_weight(self.model, weights, self.optimizer,
+                                           self.ema if self.use_ema else None)
+        vis_gt_data_path=os.path.join(os.path.dirname(weights),f'vis_gt_data_{self.start_epoch-1}.pdparams')
+        if os.path.exists(vis_gt_data_path):
+            self.vis_gt_data = paddle.load(vis_gt_data_path)
+        logger.debug("Resume weights of epoch {}".format(self.start_epoch))
+    def sync_single_encoder_to_dp(self, model):
+        state_dict = model.state_dict()
+        single = 'transformer_single'
+        multi = 'transformer_DPDETR'
+    
+        # 先同步 bbox head（需要同时拷贝到 vis/ir 两支）
+        bbox_suffixes = [
+            'enc_bbox_head.layers.0.weight',
+            'enc_bbox_head.layers.0.bias',
+            'enc_bbox_head.layers.1.weight',
+            'enc_bbox_head.layers.1.bias',
+            'enc_bbox_head.layers.2.weight',
+            'enc_bbox_head.layers.2.bias',
+        ]
+        for suffix in bbox_suffixes:
+            src_key = f'{single}.{suffix}'
+            for branch in ('enc_bbox_head_vis', 'enc_bbox_head_ir'):
+                dst_key = f'{multi}.{branch}{suffix[len("enc_bbox_head"):]}'  # 复用 layers.*.*
+                state_dict[dst_key] = state_dict[src_key].detach().clone()
+    
+        # 再同步 encoder output + score head（单分支→DP 分支共用）
+        shared_pairs = [
+            ('enc_output.0.weight', 'enc_output.0.weight'),
+            ('enc_output.0.bias',   'enc_output.0.bias'),
+            ('enc_output.1.weight', 'enc_output.1.weight'),
+            ('enc_output.1.bias',   'enc_output.1.bias'),
+            ('enc_score_head.weight', 'enc_score_head.weight'),
+            ('enc_score_head.bias',   'enc_score_head.bias'),
+        ]
+        for src_suffix, dst_suffix in shared_pairs:
+            state_dict[f'{multi}.{dst_suffix}'] = state_dict[f'{single}.{src_suffix}'].detach().clone()
+    
+        # 同步 query_pos_head（double MLP）和 denoising embedding
+        query_layers = [
+            'query_pos_head.layers.0.weight',
+            'query_pos_head.layers.0.bias',
+            'query_pos_head.layers.1.weight',
+            'query_pos_head.layers.1.bias',
+        ]
+        for suffix in query_layers:
+            src_key = f'{single}.{suffix}'
+            dst_key = f'{multi}.{suffix}'
+            if src_key in state_dict and dst_key in state_dict:
+                state_dict[dst_key] = state_dict[src_key].detach().clone()
+    
+        dn_key = 'denoising_class_embed.weight'
+        src_dn = f'{single}.{dn_key}'
+        dst_dn = f'{multi}.{dn_key}'
+        if src_dn in state_dict and dst_dn in state_dict:
+            state_dict[dst_dn] = state_dict[src_dn].detach().clone()
+    
+        model.set_state_dict(state_dict)
+    def _build_vis_gt_from_mask(self, keep_masks):
+        if keep_masks is None:
+            return None, None
+        bbox_fill = paddle.to_tensor(
+            np.array([np.nan, np.nan, np.nan, np.nan]), dtype='float32')
+        bbox_fill = paddle.reshape(bbox_fill, [1, 4])
+        cls_fill = paddle.to_tensor(np.array([-1]), dtype='int32')
+        cls_fill = paddle.reshape(cls_fill, [1, 1])
+        bbox_list, cls_list = [], []
+        for mask in keep_masks:
+            if mask is None:
+                num_boxes = 0
+            elif isinstance(mask, paddle.Tensor):
+                num_boxes = int(mask.shape[0])
+            else:
+                num_boxes = len(mask)
+            if num_boxes == 0:
+                bbox_list.append(
+                    paddle.full([0, 4], float('nan'), dtype='float32'))
+                cls_list.append(paddle.full([0, 1], -1, dtype='int32'))
+            else:
+                bbox_list.append(
+                    paddle.tile(bbox_fill, repeat_times=[num_boxes, 1]))
+                cls_list.append(
+                    paddle.tile(cls_fill, repeat_times=[num_boxes, 1]))
+        return bbox_list, cls_list
+    def train(self, validate=False):
+        assert self.mode == 'train', "Model not in 'train' mode"
+        Init_mark = False
+        
+        self.semi_start_epochs = self.cfg.get('semi_start_epochs', 30)
+        self.psudo_labels_threhold = self.cfg.get('psudo_label_threhold', 0.4)
+        self.stage2_start_epochs = self.cfg.get('stage2_start_epochs', 12)
+        self.stage3_start_epochs = self.cfg.get('stage3_start_epochs', 18)
+        stage2_iter = self.stage2_start_epochs * len(self.loader)
+        st_iter = self.semi_start_epochs * len(self.loader)
+        stage3_iter = self.stage3_start_epochs * len(self.loader)
+        
+        if validate:
+            self.cfg['EvalDataset'] = self.cfg.EvalDataset = create(
+                "EvalDataset")()
+
+        train_cfg = self.cfg['train_cfg']
+
+        #model = self.model
+        if self.cfg.get('to_static', False):
+            self.model = apply_to_static(self.cfg, self.model)
+        sync_bn = (
+            getattr(self.cfg, 'norm_type', None) == 'sync_bn' and
+            (self.cfg.use_gpu or self.cfg.use_npu or self.cfg.use_mlu) and
+            self._nranks > 1)
+        if sync_bn:
+            self.model = paddle.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
+
+        # enabel auto mixed precision mode
+        if self.use_amp:
+            scaler = paddle.amp.GradScaler(
+                enable=self.cfg.use_gpu or self.cfg.use_npu or self.cfg.use_mlu,
+                init_loss_scaling=self.cfg.get('init_loss_scaling', 1024))
+        # get distributed model
+        if self.cfg.get('fleet', False):
+            self.model = fleet.distributed_model(self.model)
+            self.optimizer = fleet.distributed_optimizer(self.optimizer)
+        elif self._nranks > 1:
+            find_unused_parameters = self.cfg[
+                'find_unused_parameters'] if 'find_unused_parameters' in self.cfg else False
+            self.model = paddle.DataParallel(
+                self.model, find_unused_parameters=find_unused_parameters)
+
+        self.status.update({
+            'epoch_id': self.start_epoch,
+            'step_id': 0,
+            'steps_per_epoch': len(self.loader)
+        })
+
+        self.status['batch_time'] = stats.SmoothedValue(
+            self.cfg.log_iter, fmt='{avg:.4f}')
+        self.status['data_time'] = stats.SmoothedValue(
+            self.cfg.log_iter, fmt='{avg:.4f}')
+        self.status['training_staus'] = stats.TrainingStats(self.cfg.log_iter)
+
+        if self.cfg.get('print_flops', False):
+            flops_loader = create('{}Reader'.format(self.mode.capitalize()))(
+                self.dataset, self.cfg.worker_num)
+            self._flops(flops_loader)
+        profiler_options = self.cfg.get('profiler_options', None)
+
+        self._compose_callback.on_train_begin(self.status)
+
+        use_fused_allreduce_gradients = self.cfg[
+            'use_fused_allreduce_gradients'] if 'use_fused_allreduce_gradients' in self.cfg else False
+
+        for param in self.ema.model.parameters():
+            param.stop_gradient = True
+
+        #self.iou_matrix = ProbIoULoss()
+
+        for epoch_id in range(self.start_epoch, self.cfg.epoch):
+            self.status['mode'] = 'train'
+            self.status['epoch_id'] = epoch_id
+            self.epoch=epoch_id
+            self._compose_callback.on_epoch_begin(self.status)
+            self.loader.dataset.set_epoch(epoch_id)
+            #model.train()
+            iter_tic = time.time()
+
+            loss_dict = {
+                'loss': paddle.to_tensor([0]),
+                'loss_sup_sum': paddle.to_tensor([0]),
+                'loss_unsup_sum': paddle.to_tensor([0]),
+                'fg_sum': paddle.to_tensor([0]),
+            }
+            self.model.train()
+            self.ema.model.eval()
+            for step_id, data in enumerate(self.loader):
+                H = data['im_shape'][0,0].item()
+                W = data['im_shape'][0,1].item()
+                self.step = step_id
+                bs = data['im_id'].shape[0]
+                self.status['data_time'].update(time.time() - iter_tic)
+                self.status['step_id'] = step_id
+                profiler.add_profiler_step(profiler_options)
+                self._compose_callback.on_step_begin(self.status)
+                data['epoch_id'] = epoch_id
+                if self.cfg.get('to_static',
+                                False) and 'image_file' in data.keys():
+                    data.pop('image_file')
+
+                if self.use_amp:
+                    if isinstance(
+                            self.model, paddle.
+                            DataParallel) and use_fused_allreduce_gradients:
+                        with self.model.no_sync():
+                            with paddle.amp.auto_cast(
+                                    enable=self.cfg.use_gpu or
+                                    self.cfg.use_npu or self.cfg.use_mlu,
+                                    custom_white_list=self.custom_white_list,
+                                    custom_black_list=self.custom_black_list,
+                                    level=self.amp_level):
+                                # model forward
+                                outputs = self.model(data)
+                                loss = outputs['loss']
+                            # model backward
+                            scaled_loss = scaler.scale(loss)
+                            scaled_loss.backward()
+                        fused_allreduce_gradients(
+                            list(self.model.parameters()), None)
+                    else:
+                        with paddle.amp.auto_cast(
+                                enable=self.cfg.use_gpu or self.cfg.use_npu or
+                                self.cfg.use_mlu,
+                                custom_white_list=self.custom_white_list,
+                                custom_black_list=self.custom_black_list,
+                                level=self.amp_level):
+                            # model forward
+                            outputs = self.model(data)
+                            loss = outputs['loss']
+                        # model backward
+                        scaled_loss = scaler.scale(loss)
+                        scaled_loss.backward()
+                    # in dygraph mode, optimizer.minimize is equal to optimizer.step
+                    scaler.minimize(self.optimizer, scaled_loss)
+                else:
+                    if isinstance(
+                            self.model, paddle.
+                            DataParallel) and use_fused_allreduce_gradients:
+                        with self.model.no_sync():
+                            # model forward
+                            outputs = self.model(data)
+                            loss = outputs['loss']
+                            # model backward
+                            loss.backward()
+                        fused_allreduce_gradients(
+                            list(self.model.parameters()), None)
+                    else:
+
+                        curr_iter = len(self.loader) * epoch_id + step_id
+                        self.ema_start_iter = self.ema_start_epochs * len(self.loader)
+###############################################################################################################STAGE 1
+##################################sup- 真实标签监督   unsup- 伪标签监督   multi- DP-MSDecoder###################
+                        if curr_iter < stage2_iter:
+
+                            if curr_iter == 0:
+                                logger.info("***" * 30)
+                                logger.info('STAGE 1 ...')
+                                logger.info("***" * 30)
+
+                            self.model.train()
+                            self.ema.model.eval()
+
+                            # concat sup data (vis, vis_aug)
+                            #data['vis_image_cat'] = paddle.concat([data['vis_image_aug'],data['vis_image']])
+                            data['ir_image_cat'] = paddle.concat([data['ir_image_aug'],data['ir_image']])
+                            # # concat sup label
+                            # data['gt_bbox_vis_cat'] = paddle.concat([data['gt_bbox_vis'],data['gt_bbox_vis']])
+                            # data['gt_poly_vis_cat'] = paddle.concat([data['gt_poly_vis'],data['gt_poly_vis']])
+                            # data['gt_bbox_vis_cat'] = paddle.concat([data['gt_bbox_vis'],data['gt_bbox_vis']])
+
+                            # model forward
+                            data['flag'] = 3
+                            outputs = self.model(data) #flag=3 means do sup_concat train
+                            loss_sup = outputs['loss'] * self.cfg['sup_weight']
+                            # model backward
+                            loss_sup.backward()
+                            losses = loss_sup.detach()
+
+                            if self.use_ema and curr_iter == self.ema_start_iter:
+                                logger.info("***" * 30)
+                                logger.info('EMA starting ...')
+                                logger.info("***" * 30)
+                                self.ema.update(self.model, decay=0)
+                                self.ema.apply()
+                            if curr_iter == st_iter:
+                                self.vis_gt_data=dict()
+                                logger.info("***" * 30)
+                                logger.info('Semi starting ...')
+                                logger.info("***" * 30)
+                            if curr_iter >= st_iter:
+
+                                unsup_weight = train_cfg['unsup_weight']
+
+                                if train_cfg['suppress'] == 'linear':
+                                    tar_iter=int(st_iter+(stage2_iter-st_iter)*2/3)
+                                    if curr_iter <= tar_iter:
+                                        progress = (curr_iter - st_iter) / max(1, (tar_iter - st_iter))
+                                        progress = max(0.0, min(1.0, progress))
+                                        unsup_weight *= progress
+                                elif train_cfg['suppress'] == 'exp':
+                                    tar_iter = st_iter + 2000
+                                    if curr_iter <= tar_iter:
+                                        scale = np.exp((curr_iter - tar_iter) / 1000)
+                                        unsup_weight *= scale
+                                elif train_cfg['suppress'] == 'step':
+                                    tar_iter = st_iter * 2
+                                    if curr_iter <= tar_iter:
+                                        unsup_weight *= 0.25
+                                else:
+                                    raise ValueError
+
+                                with paddle.no_grad():
+                                    #data_unsup_w['is_teacher'] = True
+                                    data['flag'] = 5 #5 means do teacher preds  unsup_w
+                                    teacher_preds = self.ema.model(data)
+                                    #fliter high socre preds as persudo labels
+                                    # mean = teacher_preds['bbox'][:,1][teacher_preds['bbox'][:,1]>0.2].mean().item()
+                                    # std = teacher_preds['bbox'][:,1][teacher_preds['bbox'][:,1]>0.2].std().item()
+                                    bbox_y = teacher_preds['bbox'][:, 1]
+                                    valid_y = bbox_y[bbox_y > 0.3]
+                                    if valid_y.shape[0] > 0:
+                                        mean = valid_y.mean().item()
+                                        std = valid_y.std().item()
+                                    else:
+                                        mean = 10.0  # 或者你可以选择别的默认值，比如 None
+                                        std = 0.0
+
+                                    teacher_preds['bbox'] = paddle.split(teacher_preds['bbox'],bs,0)
+                                    teacher_preds['class'] = []
+                                    teacher_preds['score'] = []
+                                    # filterd_teacher_preds = dict()
+                                    # filterd_teacher_preds['bbox'] = []
+                                    # filterd_teacher_preds['class'] = []
+                                    for xx in range(len(teacher_preds['bbox'])) :
+                                        teacher_preds['bbox'][xx] = teacher_preds['bbox'][xx][
+                                            (teacher_preds['bbox'][xx][:, 1] > (mean - std)) & (teacher_preds['bbox'][xx][:, 1] > 0.3)]
+                                        teacher_preds['bbox_num'][xx] = len(teacher_preds['bbox'][xx])
+                                        teacher_preds['class'].append(teacher_preds['bbox'][xx][:,0].unsqueeze(1).astype('int32'))
+                                        teacher_preds['score'].append(teacher_preds['bbox'][xx][:,1].unsqueeze(1))
+                                        teacher_preds['bbox'][xx] = teacher_preds['bbox'][xx][:, 2:]
+                               
+                                if epoch_id==self.semi_start_epochs:###记得保存模型的时候也得把self.vis_gt_data保存下来                                  
+                                    vis_bbox_placeholder, vis_cls_placeholder = self._build_vis_gt_from_mask(
+                                        data.get('gt_bbox_keep_mask'))
+                                    if vis_bbox_placeholder is None:
+                                        vis_bbox_placeholder = [
+                                            t.clone() for t in data['gt_bbox_ir']
+                                        ]
+                                        vis_cls_placeholder = [
+                                            t.clone() for t in data['gt_class']
+                                        ]
+                                    if 'im_id' not in self.vis_gt_data and 'gt_bbox_vis' not in self.vis_gt_data:
+                                        self.vis_gt_data = {
+                                            'im_id': data['im_id'].clone(),  # 或 paddle.to_tensor(data['im_id'].numpy())
+                                            'gt_bbox_vis': vis_bbox_placeholder,
+                                            'gt_class': vis_cls_placeholder
+                                        }
+                                    else:
+                                        self.vis_gt_data['im_id'] = paddle.concat(
+                                            [self.vis_gt_data['im_id'], data['im_id'].clone()], axis=0
+                                        )
+                                        self.vis_gt_data['gt_bbox_vis'] += vis_bbox_placeholder
+                                        self.vis_gt_data['gt_class'] += vis_cls_placeholder
+                                paired_gt_bbox_ir_match, paired_gt_bbox_ir_unmatch, paired_gt_class, \
+                                    paired_teacher_bbox_match, paired_teacher_bbox_unmatch= self.paired_label_processing(data,teacher_preds['bbox'],teacher_preds['class'],teacher_preds['score'])
+                                class_ir_match=[]
+                                class_ir_unmatch=[]
+                                for i,value in enumerate(paired_gt_bbox_ir_match):
+                                    num=(value.shape)[0]
+                                    class_ir_match.append(paired_gt_class[i][:num])
+                                    class_ir_unmatch.append(paired_gt_class[i][num:])                          
+                                self.paired_label_visual(data['im_id'],data['ir_image'],data['vis_image'],{'bbox': data['gt_bbox_ir'],'class':data['gt_class']},teacher_preds,H,W)
+                                # if self.epoch >= self.semi_start_epochs+4:
+                                #     self.paired_label_visual_shiftcorrectshow(data['im_id'],data['ir_image'],data['vis_image'],{'bbox': data['gt_bbox_ir'],'class':data['gt_class']},paired_teacher_bbox_match)
+                                for i in range(len(paired_teacher_bbox_match)):
+                                    tensor = paired_teacher_bbox_match[i]
+                                    if list(tensor.shape) == [0]:
+                                        # 替换为 [0, 4] 的空 tensor
+                                        paired_teacher_bbox_match[i] = paddle.empty([0, 4], dtype=tensor.dtype)
+                                
+                                data['teacher_gt_class']=class_ir_match
+                                data['teacher_gt_bbox_vis']=paired_teacher_bbox_match
+                                data['flag'] = 4
+                                student_preds = self.model(data)
+
+                                train_cfg['curr_iter'] = curr_iter
+                                train_cfg['st_iter'] = st_iter
+
+                                # loss_dict_unsup = self.model.get_ssod_loss_single((student_preds[0], student_preds[1], student_preds[2],
+                                #                                             teacher_preds['bbox'], teacher_preds['class'], data['im_shape'],
+                                #                                             None,None,None,None))
+                                loss_dict_unsup = self.model.get_ssod_loss_single((student_preds[0], student_preds[1],
+                                                                            paired_teacher_bbox_match, class_ir_match, data['im_shape'],
+                                                                            student_preds[2],student_preds[3],student_preds[4]))                                
+
+                                # fg_num = loss_dict_unsup["fg_sum"]
+                                # del loss_dict_unsup["fg_sum"]
+                                # distill_weights = train_cfg['loss_weight']
+                                # loss_dict_unsup = {
+                                #     k: v * distill_weights[k]
+                                #     for k, v in loss_dict_unsup.items()
+                                # }
+
+                                losses_unsup = loss_dict_unsup['loss'] * unsup_weight
+                                losses_unsup.backward()
+
+                                #loss_dict.update(loss_dict_unsup)
+                                loss_dict.update({'loss_unsup_sum': losses_unsup})
+                                losses += losses_unsup.detach()
+                                #loss_dict.update({"fg_sum": fg_num})
+                                loss_dict['loss'] = losses
+
+###############################################################################################################STAGE 2
+##################################sup- 真实标签监督   unsup- 伪标签监督   multi- DP-MSDecoder####################
+                        if curr_iter >= stage2_iter and curr_iter < stage3_iter: #STAGE 2
+                            if curr_iter == stage2_iter:
+                                logger.info("***" * 30)
+                                logger.info('STAGE 2 ...')
+                                logger.info("***" * 30)
+
+                                logger.info('copy weights to multi branch ......')
+                                # copy weights to multi branch
+                                model_params = self.model.state_dict()
+                                for name, param in model_params.items():
+                                    if '_stream2' in name:
+                                        stream1_name = name.replace('_stream2','_stream1')
+                                        param.set_value(model_params[stream1_name])
+                                #self.sync_single_encoder_to_dp(self.model)
+                                logger.info('copy done !!!')
+                                if self.use_ema:
+                                    logger.info("***" * 30)
+                                    logger.info('EMA starting ...')
+                                    logger.info("***" * 30)
+                                    self.ema.reset()
+                                    self.ema.update(self.model, decay=0)
+                                    self.ema.apply()
+
+                            ########STAGE 2 ---- SINGLE BRANCH
+                            # model single forward
+                            data['flag'] = 7
+                            outputs = self.model(data)  # flag=7 means do sup train
+                            loss_sup = outputs['loss'] * self.cfg['sup_weight']
+                            # model backward
+                            loss_sup.backward()
+                            losses = loss_sup.detach()
+
+                            #do unsup--single
+
+                            # _, bs, _, _ = student_preds[0].shape
+                            # H = data['im_shape'][0,0]
+                            W = data['im_shape'][0, 1]
+                            with paddle.no_grad():
+                                # data_unsup_w['is_teacher'] = True
+                                data['flag'] = 5  # 5 means do teacher preds  unsup_w
+                                teacher_preds = self.ema.model(data)
+                                bbox_y = teacher_preds['bbox'][:, 1]
+                                valid_y = bbox_y[bbox_y > 0.3]
+                                if valid_y.shape[0] > 0:
+                                    mean = valid_y.mean().item()
+                                    std = valid_y.std().item()
+                                else:
+                                    mean = 10.0  # 或者你可以选择别的默认值，比如 None
+                                    std = 0.0
+                                # fliter high socre preds as persudo labels
+                                teacher_preds['bbox'] = paddle.split(teacher_preds['bbox'], bs, 0)
+                                teacher_preds['class'] = []
+                                teacher_preds['score'] = []
+                                # filterd_teacher_preds = dict()
+                                # filterd_teacher_preds['bbox'] = []
+                                # filterd_teacher_preds['class'] = []
+                                for xx in range(len(teacher_preds['bbox'])):
+                                    teacher_preds['bbox'][xx] = teacher_preds['bbox'][xx][
+                                        (teacher_preds['bbox'][xx][:, 1] > (mean - std)) & (teacher_preds['bbox'][xx][:, 1] > 0.3)]
+                                    teacher_preds['bbox_num'][xx] = len(teacher_preds['bbox'][xx])
+                                    teacher_preds['class'].append(
+                                        teacher_preds['bbox'][xx][:, 0].unsqueeze(1).astype('int32'))
+                                    teacher_preds['score'].append(teacher_preds['bbox'][xx][:,1].unsqueeze(1))
+                                    teacher_preds['bbox'][xx] = teacher_preds['bbox'][xx][:, 2:]
+                            paired_gt_bbox_ir_match, paired_gt_bbox_ir_unmatch, paired_gt_class, \
+                                    paired_teacher_bbox_match, paired_teacher_bbox_unmatch= self.paired_label_processing(data,teacher_preds['bbox'],teacher_preds['class'],teacher_preds['score'])
+                            class_ir_match=[]
+                            class_ir_unmatch=[]
+                            for i,value in enumerate(paired_gt_bbox_ir_match):
+                                num=(value.shape)[0]
+                                class_ir_match.append(paired_gt_class[i][:num])
+                                class_ir_unmatch.append(paired_gt_class[i][num:])
+                            self.paired_label_visual(data['im_id'],data['ir_image'],data['vis_image'],{'bbox': data['gt_bbox_ir'],'class':data['gt_class']},teacher_preds,H,W)
+                            for i in range(len(paired_teacher_bbox_match)):
+                                tensor = paired_teacher_bbox_match[i]
+                                if list(tensor.shape) == [0]:
+                                    # 替换为 [0, 4] 的空 tensor
+                                    paired_teacher_bbox_match[i] = paddle.empty([0, 4], dtype=tensor.dtype)
+                            data['teacher_gt_class']=class_ir_match
+                            data['teacher_gt_bbox_vis']=paired_teacher_bbox_match           
+                            data['flag'] = 4  # 4 means do student preds unsup_s
+                            student_preds = self.model(data)
+                            train_cfg['curr_iter'] = curr_iter
+                            train_cfg['st_iter'] = st_iter
+                    
+                            loss_dict_unsup = self.model.get_ssod_loss_single((student_preds[0], student_preds[1],
+                                                                        paired_teacher_bbox_match, class_ir_match, data['im_shape'],
+                                                                        student_preds[2],student_preds[3],student_preds[4]))                                
+
+                            losses_unsup = loss_dict_unsup['loss'] * 1 #
+                            losses_unsup.backward()
+
+                            # loss_dict.update(loss_dict_unsup)
+                            loss_dict.update({'loss_unsup_sum': losses_unsup})
+                            losses += losses_unsup.detach()
+                            # loss_dict.update({"fg_sum": fg_num})
+                            loss_dict['loss'] = losses
+
+                            #############STAGE 2 ---- MULTI BRANCH
+
+                            data['paired_gt_bbox_ir_match'] = paired_gt_bbox_ir_match
+                            data['paired_gt_bbox_ir_unmatch'] = paired_gt_bbox_ir_unmatch
+                            data['paired_gt_class'] = paired_gt_class
+                            data['paired_teacher_bbox_match'] = paired_teacher_bbox_match 
+                            data['paired_teacher_bbox_unmatch'] = paired_teacher_bbox_unmatch
+        
+                                #student do multi branch
+                            data['flag'] = 8
+                            outputs = self.model(data)  # flag=8 means do multi branch train
+                            loss_multi = outputs['loss'] * 1
+                            # model backward
+                            loss_multi.backward()
+                            losses += loss_multi.detach()
+###############################################################################################################STAGE 3
+##################################sup- 真实标签监督   unsup- 伪标签监督   multi- DP-MSDecoder####################
+                        if curr_iter >= stage3_iter: #STAGE 3
+                            if curr_iter == stage3_iter:
+                                logger.info("***" * 30)
+                                logger.info('STAGE 3 ...')
+                                logger.info("***" * 30)
+
+                            # do teacher multi
+                            with paddle.no_grad():
+                                # data_unsup_w['is_teacher'] = True
+                                data['flag'] = 9  # 9 means do teacher multi preds  unsup_w
+                                teacher_preds = self.ema.model(data)
+                                bbox_y = teacher_preds['bbox_vis'][:, 1]
+                                valid_y = bbox_y[bbox_y > 0.3]
+                                if valid_y.shape[0] > 0:
+                                    mean = valid_y.mean().item()
+                                    std = valid_y.std().item()
+                                else:
+                                    mean = 10.0  # 或者你可以选择别的默认值，比如 None
+                                    std = 0.0
+                                # fliter high socre preds as persudo labels
+                                teacher_preds['bbox'] = paddle.split(teacher_preds['bbox_vis'], bs, 0)
+                                teacher_preds['class'] = []
+                                teacher_preds['score'] = []
+
+                                for xx in range(len(teacher_preds['bbox'])):
+                                    teacher_preds['bbox'][xx] = teacher_preds['bbox'][xx][
+                                        (teacher_preds['bbox'][xx][:, 1] > (mean - std)) & (teacher_preds['bbox'][xx][:, 1] > 0.3)]
+                                    teacher_preds['bbox_num'][xx] = len(teacher_preds['bbox'][xx])
+                                    teacher_preds['score'].append(teacher_preds['bbox'][xx][:,1].unsqueeze(1))
+                                    teacher_preds['class'].append(
+                                        teacher_preds['bbox'][xx][:, 0].unsqueeze(1).astype('int32'))
+                                    teacher_preds['bbox'][xx] = teacher_preds['bbox'][xx][:, 2:]
+
+                            train_cfg['curr_iter'] = curr_iter
+                            train_cfg['st_iter'] = st_iter
+
+                            paired_gt_bbox_ir_match, paired_gt_bbox_ir_unmatch, paired_gt_class, \
+                                    paired_teacher_bbox_match, paired_teacher_bbox_unmatch= self.paired_label_processing(data,teacher_preds['bbox'],teacher_preds['class'],teacher_preds['score'])
+                            class_ir_match=[]
+                            class_ir_unmatch=[]
+                            for i,value in enumerate(paired_gt_bbox_ir_match):
+                                num=(value.shape)[0]
+                                class_ir_match.append(paired_gt_class[i][:num])
+                                class_ir_unmatch.append(paired_gt_class[i][num:])
+                            self.paired_label_visual(data['im_id'],data['ir_image'],data['vis_image'],{'bbox': data['gt_bbox_ir'],'class':data['gt_class']},teacher_preds,H,W)
+                            #self.paired_label_visual_shiftcorrectshow(data['im_id'],data['ir_image'],data['vis_image'],{'bbox': data['gt_bbox_ir'],'class':data['gt_class']},paired_teacher_bbox_match) 
+                            for i in range(len(paired_teacher_bbox_match)):
+                                tensor = paired_teacher_bbox_match[i]
+                                if list(tensor.shape) == [0]:
+                                    # 替换为 [0, 4] 的空 tensor
+                                    paired_teacher_bbox_match[i] = paddle.empty([0, 4], dtype=tensor.dtype)                           
+                            data['paired_gt_bbox_ir_match'] = paired_gt_bbox_ir_match
+                            data['paired_gt_bbox_ir_unmatch'] = paired_gt_bbox_ir_unmatch
+                            data['paired_gt_class'] = paired_gt_class
+                            data['paired_teacher_bbox_match'] = paired_teacher_bbox_match 
+                            data['paired_teacher_bbox_unmatch'] = paired_teacher_bbox_unmatch
+                            # student do multi branch
+                            data['flag'] = 10
+                            outputs = self.model(data)  # flag=8 means do multi branch train
+                            loss_multi = outputs['loss'] * 1
+                            # model backward
+                            loss_multi.backward()
+                            losses = loss_multi.detach()
+                    self.optimizer.step()
+                curr_lr = self.optimizer.get_lr()
+                self.lr.step()
+                if self.cfg.get('unstructured_prune'):
+                    self.pruner.step()
+                self.optimizer.clear_grad()
+                self.status['learning_rate'] = curr_lr
+
+                if self._nranks < 2 or self._local_rank == 0:
+                    if curr_iter >= stage2_iter and curr_iter <= stage3_iter:
+                        self.status['training_staus'].update(outputs, flag=1)
+                    else:
+                        self.status['training_staus'].update(outputs)
+
+                self.status['batch_time'].update(time.time() - iter_tic)
+                self._compose_callback.on_step_end(self.status)
+
+                if self.use_ema and curr_iter > self.ema_start_iter:
+                    self.ema.update(self.model)
+                    self.ema.apply()
+                iter_tic = time.time()
+            if self.cfg.get('unstructured_prune'):
+                self.pruner.update_params()
+
+            is_snapshot = (self._nranks < 2 or (self._local_rank == 0 or self.cfg.metric == "Pose3DEval")) \
+                       and ((epoch_id + 1) % self.cfg.snapshot_epoch == 0 or epoch_id == self.end_epoch - 1)
+            if is_snapshot and self.use_ema:
+
+                # apply ema weight on model
+                weight = copy.deepcopy(self.ema.model.state_dict())
+                for k, v in weight.items():
+                    if paddle.is_floating_point(v):
+                        weight[k].stop_gradient = True
+                if hasattr(self.ema,'step'):
+                    # Save ema step for resume
+                    weight['ema_step'] = self.ema.step
+
+                self.status['weight'] = weight
+            if hasattr(self, 'vis_gt_data'):
+                self.status['vis_gt_data']= copy.deepcopy(self.vis_gt_data)
+            self._compose_callback.on_epoch_end(self.status)
+
+            if validate and is_snapshot:
+                if not hasattr(self, '_eval_loader'):
+                    # build evaluation dataset and loader
+                    self._eval_dataset = self.cfg.EvalDataset
+                    self._eval_batch_sampler = \
+                        paddle.io.BatchSampler(
+                            self._eval_dataset,
+                            batch_size=self.cfg.EvalReader['batch_size'])
+                    # If metric is VOC, need to be set collate_batch=False.
+                    if self.cfg.metric == 'VOC':
+                        self.cfg['EvalReader']['collate_batch'] = False
+                    if self.cfg.metric == "Pose3DEval":
+                        self._eval_loader = create('EvalReader')(
+                            self._eval_dataset, self.cfg.worker_num)
+                    else:
+                        self._eval_loader = create('EvalReader')(
+                            self._eval_dataset,
+                            self.cfg.worker_num,
+                            batch_sampler=self._eval_batch_sampler)
+                # if validation in training is enabled, metrics should be re-init
+                # Init_mark makes sure this code will only execute once
+                if validate and Init_mark == False:
+                    Init_mark = True
+                    self._init_metrics(validate=validate)
+                    self._reset_metrics()
+
+                with paddle.no_grad():
+                    self.status['save_best_model'] = True
+                    if epoch_id > self.semi_start_epochs:
+                        eval_flag = 1
+                    else:
+                        eval_flag = 0
+                    if curr_iter <= stage2_iter:
+                        self._eval_with_loader(self._eval_loader, eval_flag, my_eval_flag='eval_stage1')
+                    elif curr_iter > stage2_iter and curr_iter <= stage3_iter:
+                        self._eval_with_loader(self._eval_loader, eval_flag, my_eval_flag='eval_stage2')
+                    elif curr_iter > stage3_iter:
+                        self._eval_with_loader(self._eval_loader, eval_flag, my_eval_flag='eval_stage3')
+
+            if is_snapshot and self.use_ema:
+                self.status.pop('weight')
+
+        self._compose_callback.on_train_end(self.status)
+
+    def paired_label_visual(self, im_id, ir_image, vis_image, bboxes_ir, bboxes_vis, H, W):
+        bboxes_ir= copy.deepcopy(bboxes_ir)
+        def _maybe_to_pixel(bbox_tensor):
+            if bbox_tensor is None or bbox_tensor.shape[0] == 0:
+                return
+            # 如果坐标值已经远大于 1，则认为已经是像素坐标
+            max_val = float(paddle.max(paddle.abs(bbox_tensor[:, :2])))
+            if max_val > 2.0:
+                return
+            bbox_tensor[:, 0] *= W
+            bbox_tensor[:, 2] *= W
+            bbox_tensor[:, 1] *= H
+            bbox_tensor[:, 3] *= H
+        for bbox_tensor in bboxes_vis['bbox']:
+            _maybe_to_pixel(bbox_tensor)
+        for bbox_tensor in bboxes_ir['bbox']:
+            _maybe_to_pixel(bbox_tensor)
+
+        def box2corners(pred_bboxes):
+            x, y, w, h= pred_bboxes
+            angle=0
+            cos_a_half = math.cos(angle) * 0.5
+            sin_a_half = math.sin(angle) * 0.5
+            w_x = cos_a_half * w
+            w_y = sin_a_half * w
+            h_x = -sin_a_half * h
+            h_y = cos_a_half * h
+            return np.array([x + w_x + h_x, y + w_y + h_y, x - w_x + h_x, y - w_y + h_y,x - w_x - h_x, y - w_y - h_y, x + w_x - h_x, y + w_y - h_y])
+        def draw_bbox_paired(image, bboxes,i):
+            """
+            Draw bbox on image
+            """
+            bboxes=copy.deepcopy(bboxes)
+            draw = ImageDraw.Draw(image)
+            count= 0
+            catid2color = {}
+            catid2name={0: 'car', 1: 'truck', 2: 'bus', 3: 'van', 4: 'feright'}
+            for key, value in bboxes.items():
+                for k,value1 in enumerate(bboxes[key]):
+                    bboxes[key][k]=value1.numpy()
+            for j,_ in enumerate(bboxes['bbox'][i]):
+                if bboxes.get('score') is not None:
+                    catid, bbox, score = bboxes['class'][i][j], bboxes['bbox'][i][j], bboxes['score'][i][j]
+                else:
+                    catid, bbox= bboxes['class'][i][j], bboxes['bbox'][i][j]
+                # if score < threshold:
+                #     continue
+                catid=catid[0]
+                if catid not in catid2color:
+                    if catid == 0:
+                        catid2color[catid] = np.array([16, 215, 248])# 255 0 0
+                    elif catid == 1:
+                        catid2color[catid] = np.array([0, 0, 255])
+                    elif catid == 2:
+                        catid2color[catid] = np.array([0, 255, 0])
+                    elif catid == 3:
+                        catid2color[catid] = np.array([255, 165, 0])
+                    elif catid == 4:
+                        catid2color[catid] = np.array([160, 32, 240])
+                        # idx = np.random.randint(len(color_list))
+                        # catid2color[catid] = color_list[idx]
+                color = tuple(catid2color[catid]) 
+                x1, y1, x2, y2, x3, y3, x4, y4 = box2corners(bbox)#*840/640
+                draw.line(
+                    [(x1, y1), (x2, y2), (x3, y3), (x4, y4), (x1, y1)],
+                    width=2,
+                    fill=color)
+                xmin = min(x1, x2, x3, x4)
+                ymin = min(y1, y2, y3, y4)
+                xmax = max(x1, x2, x3, x4)
+                ymax = max(y1, y2, y3, y4)
+                if bboxes.get('score') is not None:
+                    text = "{}|{}|{:.2f}".format(count,catid2name[catid],score[0])
+                else:
+                    text = "{}|{}".format(count,catid2name[catid])
+                count+=1
+                bbox = draw.textbbox((0,0), text)
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+                draw.rectangle(
+                    [(xmin + 1, ymin - th), (xmin + tw + 1, ymin)], fill=color)
+                draw.text((xmin + 1, ymin - th), text, fill=(255, 255, 255))
+            return image
+            
+        def tensor_to_pil_images(tensor):
+            tensor=copy.deepcopy(tensor)
+            # 反标准化参数（ImageNet）
+            mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+            std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+            
+            # 将 Tensor 数据移动到 CPU 并转换为 numpy 数组
+            tensor_np = tensor.numpy()  # 假设已处理过梯度或位于 CPU
+            
+            images = []
+            for batch in range(tensor_np.shape[0]):
+                # 提取单张图像数据 [3, H, W]
+                img_data = tensor_np[batch]
+                
+                # 反标准化
+                img_data = img_data * std + mean
+                img_data = np.clip(img_data, 0, 1)  # 限制数值范围
+                
+                # 转换为 HWC 格式并调整到 [0, 255]
+                img_data = np.transpose(img_data, (1, 2, 0))
+                img_data = (img_data * 255).astype(np.uint8)
+                
+                # 生成 PIL 图像
+                images.append(Image.fromarray(img_data))
+            return images
+        folder = os.path.join(
+            REPO_ROOT,
+            'label_vision',
+            'irgt_vispred_vision',
+            'vision9',
+            str(self.epoch))
+        # 创建文件夹（如果不存在，且支持递归创建多级目录）
+        os.makedirs(folder, exist_ok=True)
+        ir_images=tensor_to_pil_images(ir_image)
+        vis_images=tensor_to_pil_images(vis_image)
+        im_id=copy.deepcopy(im_id)
+        imid2savepath={}
+        for i,id in enumerate(im_id.numpy()):
+            filename=self.coco_ir.loadImgs([id[0]])[0]['file_name']
+            if os.path.exists(f'{self.cfg.TrainDataset.dataset_dir}/train_imgs_1000/vis/{filename}'):
+                id_str_ir = filename.split('.')[0]+'_ir.jpg'
+                id_str_vis = filename.split('.')[0]+'_vis.jpg'
+                ir_image_savepath = f'{folder}/{id_str_ir}'
+                vis_image_savepath = f'{folder}/{id_str_vis}'
+                vis_image=vis_images[i]
+                ir_image=ir_images[i]
+                vis_image=draw_bbox_paired(vis_image,bboxes_vis,i)
+                ir_image=draw_bbox_paired(ir_image,bboxes_ir,i) 
+                #logger.info("Detection bbox results save in {}".format(ir_image_savepath+' '+vis_image_savepath))
+                vis_image.save(vis_image_savepath, format='PNG')
+                ir_image.save(ir_image_savepath, format='PNG')  
+
+##############################################################################################################
+    def _solve_global_matching_hbox(self, ir_boxes, vis_boxes, vis_scores, return_details=False):
+        """
+        [水平框版本] 核心匹配引擎 (Hungarian Algorithm)
+        输入: ir_boxes [M, 4], vis_boxes [N, 4] (cx, cy, w, h)
+        """
+        num_ir = len(ir_boxes)
+        num_vis = len(vis_boxes)
+        matched_dict = {}
+
+        if num_ir == 0 or num_vis == 0:
+            if return_details: return matched_dict, None
+            return matched_dict
+
+        # --- 关键修复: 确保 vis_scores 是 1D 数组 ---
+        vis_scores = vis_scores.flatten() 
+
+        # 1. 数据准备
+        # ir: [M, 1], vis: [1, N] 以便广播
+        w_ir, h_ir = ir_boxes[:, 2:3], ir_boxes[:, 3:4]
+        w_vis, h_vis = vis_boxes[np.newaxis, :, 2], vis_boxes[np.newaxis, :, 3]
+        cx_ir, cy_ir = ir_boxes[:, 0:1], ir_boxes[:, 1:2]
+        cx_vis, cy_vis = vis_boxes[np.newaxis, :, 0], vis_boxes[np.newaxis, :, 1]
+        
+        # 提取中心点用于 Mask
+        vis_centers = vis_boxes[:, 0:2]
+        eps = 1e-6
+
+        # --- 2. Cost 计算 ---
+
+        # [A] Shape Cost: Re-centered IoU
+        inter_w = np.minimum(w_ir, w_vis)
+        inter_h = np.minimum(h_ir, h_vis)
+        inter_area = np.maximum(inter_w, 0) * np.maximum(inter_h, 0)
+        
+        area_ir = w_ir * h_ir
+        area_vis = w_vis * h_vis
+        union_area = area_ir + area_vis - inter_area
+        
+        shape_iou = inter_area / (union_area + eps)
+        shape_cost = 1.0 - shape_iou    
+
+        # [B] Distance Cost: 各向异性归一化 (Component-wise Normalization)
+        # 解决长宽比悬殊问题：X轴偏移除以宽，Y轴偏移除以高
+        diff_x = np.abs(cx_ir - cx_vis)
+        diff_y = np.abs(cy_ir - cy_vis)
+        
+        norm_dx = diff_x / (w_ir + eps)
+        norm_dy = diff_y / (h_ir + eps)
+        
+        # 组合 Cost (L2 范数)
+        dist_cost = np.sqrt(norm_dx**2 + norm_dy**2)
+
+        # [C] Score Cost
+        score_cost = 1.0 - vis_scores[np.newaxis, :] 
+        score_cost = np.repeat(score_cost, num_ir, axis=0)
+
+        # [Total Cost]
+        lambda_shape, lambda_dist, lambda_cls = 2.0, 0.2, 1.0
+        total_cost = (lambda_shape * shape_cost) + \
+                     (lambda_dist * dist_cost) + \
+                     (lambda_cls * score_cost)
+
+        # --- 3. Masking: 几何包含 ---
+        # 方式1：使用 points_in_rotated_box (兼容性好)
+        for i in range(num_ir):
+            # 兼容 ir_box 可能包含角度的情况，只取前4位用于几何判断
+            # 如果是纯水平框任务，points_in_rotated_box 内部应设 angle=0
+            is_in_box = self.points_in_rotated_box(vis_centers, ir_boxes[i])
+            total_cost[i, ~is_in_box] = 10000.0        
+        
+        # 方式2 (可选)：纯numpy加速版 (仅适用于纯水平框任务)
+        # is_in_box_mask = (diff_x < w_ir/2) & (diff_y < h_ir/2) # [M, N]
+        # total_cost[~is_in_box_mask] = 10000.0
+
+        # --- 4. Matching ---
+        row_inds, col_inds = linear_sum_assignment(total_cost)
+
+        for r, c in zip(row_inds, col_inds):
+            # 筛选阈值：Total < 5000 (未被Mask) 且 Shape Cost < 0.35 (IoU > 0.65)
+            if total_cost[r, c] < 5000.0 and shape_cost[r, c] < 0.35: 
+                matched_dict[r] = c
+        
+        # 返回详情用于可视化
+        if return_details:
+            details = {
+                'shape': shape_cost,
+                'dist': dist_cost,
+                'score': score_cost,
+                'total': total_cost
+            }
+            return matched_dict, details
+
+        return matched_dict
+    def _update_label_state(self, index, mask_rank, ir_box, ir_cls, vis_box, is_matched, epoch):
+        """模块3: 标签更新逻辑"""
+        target_vis_box = None
+        target_vis_cls = None
+        
+        if is_matched:
+            # 构造混合 Box: 位置用 VIS, 宽高用 IR (保持您原逻辑)
+            vis_tensor = paddle.to_tensor(
+                np.array([vis_box[0], vis_box[1], ir_box[2], ir_box[3]], dtype='float32')
+            )
+            cls_tensor = paddle.to_tensor(ir_cls)
+            
+            # 更新全局数据 (此时是 Normalized 坐标)
+            self.vis_gt_data['gt_bbox_vis'][index][mask_rank, :] = vis_tensor
+            self.vis_gt_data['gt_class'][index][mask_rank, :] = cls_tensor
+            
+            target_vis_box = self.vis_gt_data['gt_bbox_vis'][index][mask_rank, :]
+            target_vis_cls = self.vis_gt_data['gt_class'][index][mask_rank, :]
+
+        else:
+            # Bag-update 启动逻辑
+            if epoch == self.semi_start_epochs + 4:
+                self.vis_gt_data['gt_bbox_vis'][index][mask_rank, :] = paddle.to_tensor(ir_box)
+                self.vis_gt_data['gt_class'][index][mask_rank, :] = paddle.to_tensor(ir_cls)
+                target_vis_box = self.vis_gt_data['gt_bbox_vis'][index][mask_rank]
+                target_vis_cls = self.vis_gt_data['gt_class'][index][mask_rank]
+            elif epoch > self.semi_start_epochs + 4:
+                if paddle.isnan(self.vis_gt_data['gt_bbox_vis'][index][mask_rank]).any():
+                    self.vis_gt_data['gt_bbox_vis'][index][mask_rank, :] = paddle.to_tensor(ir_box)
+                    self.vis_gt_data['gt_class'][index][mask_rank, :] = paddle.to_tensor(ir_cls)
+                target_vis_box = self.vis_gt_data['gt_bbox_vis'][index][mask_rank]
+                target_vis_cls = self.vis_gt_data['gt_class'][index][mask_rank]
+
+        return target_vis_box, target_vis_cls
+    def _extract_transform_info(self, data):
+        affine = data.get('paired_affine', None)
+        ori_shape = data.get('paired_ori_shape', None)
+        curr_shape = data.get('paired_curr_shape', None)
+        if affine is None or ori_shape is None or curr_shape is None:
+            return None, None, None
+
+        def _to_numpy(array):
+            if isinstance(array, paddle.Tensor):
+                return array.numpy()
+            return np.array(array)
+
+        return _to_numpy(affine), _to_numpy(ori_shape), _to_numpy(curr_shape)
+    def _convert_bbox_norm(self, bboxes, affine, ori_hw, curr_hw, to_current=True, plot=False):
+        if bboxes is None:
+            return bboxes
+        needs_tensor = isinstance(bboxes, paddle.Tensor)
+        if needs_tensor:
+            dtype = bboxes.dtype
+            bboxes_np = bboxes.numpy()
+        else:
+            bboxes_np = np.array(bboxes, dtype='float32', copy=True)
+        if bboxes_np.size == 0:
+            return bboxes if needs_tensor else bboxes_np
+        ori_h, ori_w = float(ori_hw[0]), float(ori_hw[1])
+        curr_h, curr_w = float(curr_hw[0]), float(curr_hw[1])
+        scale_x, scale_y, trans_x, trans_y = affine
+        eps = 1e-6
+        if to_current:
+            cx = bboxes_np[:, 0] * ori_w
+            cy = bboxes_np[:, 1] * ori_h
+            w = bboxes_np[:, 2] * ori_w
+            h = bboxes_np[:, 3] * ori_h
+            cx = cx * scale_x + trans_x
+            cy = cy * scale_y + trans_y
+            w = w * abs(scale_x)
+            h = h * abs(scale_y)
+            bboxes_np[:, 0] = cx / max(curr_w, eps)
+            bboxes_np[:, 1] = cy / max(curr_h, eps)
+            bboxes_np[:, 2] = w / max(curr_w, eps)
+            bboxes_np[:, 3] = h / max(curr_h, eps)
+        else:
+            cx = bboxes_np[:, 0] * curr_w
+            cy = bboxes_np[:, 1] * curr_h
+            w = bboxes_np[:, 2] * curr_w
+            h = bboxes_np[:, 3] * curr_h
+            scale_x_safe = scale_x if abs(scale_x) > eps else (eps if scale_x >= 0 else -eps)
+            scale_y_safe = scale_y if abs(scale_y) > eps else (eps if scale_y >= 0 else -eps)
+            cx = (cx - trans_x) / scale_x_safe
+            cy = (cy - trans_y) / scale_y_safe
+            w = w / abs(scale_x_safe)
+            h = h / abs(scale_y_safe)
+            if plot:
+                bboxes_np[:, 0] = cx
+                bboxes_np[:, 1] = cy
+                bboxes_np[:, 2] = w
+                bboxes_np[:, 3] = h
+            else:
+                bboxes_np[:, 0] = cx / max(ori_w, eps)
+                bboxes_np[:, 1] = cy / max(ori_h, eps)
+                bboxes_np[:, 2] = w / max(ori_w, eps)
+                bboxes_np[:, 3] = h / max(ori_h, eps)
+        if needs_tensor:
+            return paddle.to_tensor(bboxes_np, dtype=dtype)
+        return bboxes_np
+
+    def _bbox_orig_to_curr(self, bboxes, affine, ori_hw, curr_hw):
+        return self._convert_bbox_norm(bboxes, affine, ori_hw, curr_hw, to_current=True)
+
+    def _bbox_curr_to_orig(self, bboxes, affine, ori_hw, curr_hw, plot=False):
+        return self._convert_bbox_norm(bboxes, affine, ori_hw, curr_hw, to_current=False, plot=plot)
+    def box2corners(self, pred_bbox):
+        x, y, w, h= pred_bbox
+        angle=0
+        cos_a_half = math.cos(angle) * 0.5
+        sin_a_half = math.sin(angle) * 0.5
+        w_x = cos_a_half * w
+        w_y = sin_a_half * w
+        h_x = -sin_a_half * h
+        h_y = cos_a_half * h
+        return np.array([
+            x + w_x + h_x, y + w_y + h_y,
+            x - w_x + h_x, y - w_y + h_y,
+            x - w_x - h_x, y - w_y - h_y,
+            x + w_x - h_x, y + w_y - h_y
+        ])
+    def draw_dashed_line(self,draw, p1, p2, dash_length=5, gap_length=5, **kwargs):
+        """
+        在 draw 上绘制从 p1 到 p2 的虚线段。
+        """
+        x1, y1 = p1
+        x2, y2 = p2
+        total_len = np.hypot(x2 - x1, y2 - y1)
+        dash_gap = dash_length + gap_length
+        num_dashes = int(total_len // dash_gap)
+
+        for i in range(num_dashes + 1):
+            start_frac = i * dash_gap / total_len
+            end_frac = min((i * dash_gap + dash_length) / total_len, 1.0)
+
+            sx = x1 + (x2 - x1) * start_frac
+            sy = y1 + (y2 - y1) * start_frac
+            ex = x1 + (x2 - x1) * end_frac
+            ey = y1 + (y2 - y1) * end_frac
+
+            draw.line([(sx, sy), (ex, ey)], **kwargs)
+    def draw_bbox_vis(self, image, bboxes_vis,bboxes_ir):
+        """
+        只对单张图像的 bboxes_vis 和 bboxes_ir 做可视化
+        bboxes_vis 是 list，bboxes_ir 是 dict 包含 'bbox'
+        """
+        bboxes_vis = copy.deepcopy(bboxes_vis)
+        draw = ImageDraw.Draw(image)
+        for bbox in bboxes_vis:
+            x1, y1, x2, y2, x3, y3, x4, y4 = self.box2corners(bbox)
+            draw.line([(x1, y1), (x2, y2), (x3, y3), (x4, y4), (x1, y1)],
+                    width=1, fill=(0, 255, 0))
+        for bbox in bboxes_ir:
+            x1, y1, x2, y2, x3, y3, x4, y4 = self.box2corners(bbox)
+            draw.line([(x1, y1), (x2, y2), (x3, y3), (x4, y4), (x1, y1)],
+                    width=1, fill=(255, 0, 0))
+        return image
+    def draw_bbox_ir(self,image, bboxes_ir):
+        """
+        只对单张图像的 bboxes_vis 和 bboxes_ir 做可视化
+        bboxes_vis 是 list，bboxes_ir 是 dict 包含 'bbox'
+        """
+        bboxes_ir = copy.deepcopy(bboxes_ir)
+        draw = ImageDraw.Draw(image)
+        for bbox in bboxes_ir:
+            x1, y1, x2, y2, x3, y3, x4, y4 = self.box2corners(bbox)
+            draw.line([(x1, y1), (x2, y2), (x3, y3), (x4, y4), (x1, y1)],
+                    width=1, fill=(0, 255, 0))
+        return image    
+    def _save_debug_visualization(self, ir_boxes, affine_mm, ori_hw, curr_hw, im_id_mm, index):
+        """
+        模块4: 可视化保存 (Debug Visualization)
+        功能：将当前修正后的 VIS 框和 IR GT 框还原回原图坐标，绘制并保存对比图。
+        """
+        try:
+            # 1. 准备保存路径
+            # 这里的 REPO_ROOT 需要确保全局可访问，或者用 self.cfg.REPO_ROOT
+            folder = os.path.join(
+                REPO_ROOT, 
+                'label_vision', 
+                'pseudo_labels_shiftcorrect_vision', 
+                'vision9', 
+                str(self.epoch)
+            )
+            os.makedirs(folder, exist_ok=True)
+
+            # 2. 获取图片文件名
+            # im_id_mm 是 float, 需要转 int
+            img_info = self.coco_ir.loadImgs([int(im_id_mm)])[0]
+            filename = img_info['file_name']
+            file_prefix = filename.split('.')[0]
+
+            # 3. 数据准备：获取当前最新的 VIS 结果和 IR GT
+            # 从全局数据中获取刚刚更新过的 VIS 框 (Tensor -> Numpy)
+            # copy.deepcopy 防止绘图时的修改影响后续训练
+            current_vis_boxes = copy.deepcopy(self.vis_gt_data['gt_bbox_vis'][index])
+            
+            # IR 框直接使用传入的 (Numpy -> Tensor -> 变换 -> Numpy)
+            current_ir_boxes = paddle.to_tensor(copy.deepcopy(ir_boxes), dtype='float32')
+
+            # 4. 坐标逆变换 (Current Normalized Space -> Original Image Space)
+            if affine_mm is not None:
+                # 使用辅助函数反算回原图坐标 (假设 plot=True 返回的是绝对坐标)
+                origin_vis_bboxes = self._bbox_curr_to_orig(
+                    current_vis_boxes, affine_mm, ori_hw, curr_hw, plot=True
+                ).numpy()
+                
+                origin_ir_bboxes = self._bbox_curr_to_orig(
+                    current_ir_boxes, affine_mm, ori_hw, curr_hw, plot=True
+                ).numpy()
+            else:
+                # 如果没有仿射变换，直接反归一化 (x * W, y * H)
+                H, W = int(ori_hw[0]), int(ori_hw[1])
+                
+                origin_vis_bboxes = current_vis_boxes.numpy()
+                origin_vis_bboxes[:, 0] *= W  # cx
+                origin_vis_bboxes[:, 2] *= W  # w
+                origin_vis_bboxes[:, 1] *= H  # cy
+                origin_vis_bboxes[:, 3] *= H  # h
+                
+                origin_ir_bboxes = current_ir_boxes.numpy()
+                origin_ir_bboxes[:, 0] *= W
+                origin_ir_bboxes[:, 2] *= W
+                origin_ir_bboxes[:, 1] *= H
+                origin_ir_bboxes[:, 3] *= H
+
+            # 5. 读取原图并绘制
+            # 假设 dataset_dir 路径在配置中
+            dataset_root = self.cfg.TrainDataset.dataset_dir
+            
+            # [绘制可见光图像]：画上 VIS 修正框(绿) 和 IR 参考框(红)
+            vis_img_path = os.path.join(dataset_root, 'train_imgs_1000', 'vis', filename)
+            if os.path.exists(vis_img_path):
+                image_vis = Image.open(vis_img_path).convert('RGB')
+                # 调用您之前的辅助绘图函数 (请确保改为 self.draw_bbox_vis)
+                image_vis = self.draw_bbox_vis(image_vis, origin_vis_bboxes, origin_ir_bboxes)
+                
+                save_path_vis = os.path.join(folder, f"{file_prefix}_vis_shiftcorrect.jpg")
+                image_vis.save(save_path_vis, format='PNG')
+
+            # [绘制红外图像]：画上 IR GT 框(红)
+            ir_img_path = os.path.join(dataset_root, 'train_imgs_1000', 'ir', filename)
+            if os.path.exists(ir_img_path):
+                image_ir = Image.open(ir_img_path).convert('RGB')
+                # 调用您之前的辅助绘图函数
+                image_ir = self.draw_bbox_ir(image_ir, origin_ir_bboxes)
+                
+                save_path_ir = os.path.join(folder, f"{file_prefix}_ir_gt.jpg")
+                image_ir.save(save_path_ir, format='PNG')
+
+        except Exception as e:
+            # 捕获绘图错误，避免因为一张图画图失败导致训练中断
+            print(f"[Vis Error] Failed to visualize im_id {im_id_mm}: {e}")
+            
+    def points_in_rotated_box(self,points, box):
+        """
+        判断哪些点在旋转矩形内
+
+        参数:
+            points: ndarray of shape (N, 2)，每行是一个 (x, y) 坐标
+            box: tuple (cx, cy, w, h, theta)，矩形中心、宽、高、角度（弧度）
+
+        返回:
+            mask: ndarray of shape (N,)，bool 数组，表示哪些点在区域内
+        """
+        cx, cy, w, h = box
+        theta_rad=0
+        # 平移坐标，使矩形中心变为原点
+        translated = points - np.array([cx, cy])
+
+        # 构建逆旋转矩阵，将点逆时针转 -theta 使矩形变为轴对齐
+        rotation_matrix = np.array([
+            [np.cos(-theta_rad), -np.sin(-theta_rad)],
+            [np.sin(-theta_rad),  np.cos(-theta_rad)]
+        ])
+
+        # 对点进行旋转
+        rotated = translated @ rotation_matrix.T
+
+        # 判断是否在轴对齐的矩形内
+        half_w, half_h = 1.2*w / 2, 1.2*h / 2
+        inside_x = np.logical_and(rotated[:, 0] >= -half_w, rotated[:, 0] <= half_w)
+        inside_y = np.logical_and(rotated[:, 1] >= -half_h, rotated[:, 1] <= half_h)
+        mask = np.logical_and(inside_x, inside_y)
+
+        return mask
+    # =========================================================================
+    # 主入口函数 
+    # =========================================================================
+    def paired_label_processing(self, data, teacher_bbox, teacher_class, teacher_score, iou_threshold=0.7):
+        # 1. 解包与深拷贝
+        gt_bbox_ir_raw = copy.deepcopy(data['gt_bbox_ir'])
+        gt_class = copy.deepcopy(data['gt_class'])
+        im_id = copy.deepcopy(data['im_id'])
+        gt_bbox_keep_mask = copy.deepcopy(data['gt_bbox_keep_mask'])
+        H, W = data['vis_image'].shape[2], data['vis_image'].shape[3]
+        
+        # 2. 预处理 (归一化 Teacher BBox)
+        self._normalize_batch_bboxes(teacher_bbox, H, W)
+
+        # 3. 预处理 (构造标准的 Tensor 列表)
+        gt_bbox_ir = []
+        for i, _ in enumerate(gt_bbox_ir_raw):
+            temp = paddle.zeros_like(gt_bbox_ir_raw[i])
+            temp[:, :] = gt_bbox_ir_raw[i][:, :]
+            gt_bbox_ir.append(temp)
+
+        # 变换信息
+        affine_info, ori_shape_info, curr_shape_info = self._extract_transform_info(data)
+        use_affine = affine_info is not None
+
+        # 结果容器
+        results = {
+            'ir_match': [], 'vis_match': [], 'cls_match': [],
+            'ir_unmatch': [], 'vis_unmatch': [], 'cls_vis_match': [] # 如果您需要第6个返回值
+        }
+
+        # === Batch Loop ===
+        for mm in range(len(gt_bbox_ir)):
+            # --- A. 准备单张图片数据 ---
+            mask = gt_bbox_keep_mask[mm]
+            kept_idx = paddle.nonzero(mask).flatten()
+            
+            ir_boxes_np = gt_bbox_ir[mm].numpy()       # [M, 4] Normalized
+            ir_cls_np = gt_class[mm].numpy()           # [M, 1]
+            vis_boxes_np = teacher_bbox[mm].numpy()    # [N, 4] Normalized
+            vis_scores_np = teacher_score[mm].numpy()  # [N]
+            
+            im_id_mm = float(im_id[mm])
+            affine_mm = affine_info[mm] if use_affine else None
+            ori_hw = ori_shape_info[mm] if use_affine else None
+            curr_hw = curr_shape_info[mm] if use_affine else np.array([H, W], dtype=np.float32)
+
+            # 找到全局数据索引
+            global_idx = np.where(self.vis_gt_data['im_id'].clone().numpy() == im_id_mm)[0][0]
+
+            # [关键步骤 1] 将全局缓存的 GT 转换到 当前视图 (Normalized) 用于匹配和更新
+            if use_affine:
+                self.vis_gt_data['gt_bbox_vis'][global_idx] = self._bbox_orig_to_curr(
+                    self.vis_gt_data['gt_bbox_vis'][global_idx], affine_mm, ori_hw, curr_hw)
+
+            # --- B. 执行核心匹配 (Module 2) ---
+            matched_pairs = self._solve_global_matching_hbox(ir_boxes_np, vis_boxes_np, vis_scores_np)
+            
+            # --- C. 遍历 IR GT 并更新状态 (Module 3) ---
+            batch_res = {'ir': [], 'vis': [], 'cls': []}
+            
+            for i in range(len(ir_boxes_np)):
+                mask_rank = int(kept_idx[i])
+                is_matched = i in matched_pairs
+                
+                vis_box_candidate = vis_boxes_np[matched_pairs[i]] if is_matched else None
+                
+                # 更新状态，并返回更新后的框
+                final_vis_box, final_vis_cls = self._update_label_state(
+                    global_idx, mask_rank, 
+                    ir_boxes_np[i], ir_cls_np[i], 
+                    vis_box_candidate, is_matched, self.epoch
+                )
+
+                # 收集结果 (注意：使用 clone 防止后续坐标还原导致这里的数据变动)
+                batch_res['ir'].append(ir_boxes_np[i])
+                if final_vis_box is not None and final_vis_cls is not None:
+                    batch_res['vis'].append(final_vis_box.clone()) 
+                    batch_res['cls'].append(final_vis_cls.clone())
+
+            # --- D. 可视化 (Module 4) ---
+            if use_affine: 
+                 self._save_debug_visualization(
+                     ir_boxes_np, affine_mm, ori_hw, curr_hw, im_id_mm, global_idx
+                 )
+
+            # [关键步骤 2 - 修复] 将更新后的 VIS GT 还原回 原始坐标系 (Original)
+            # 必须做这一步，否则下个 Epoch 的数据是错的！
+            if use_affine:
+                self.vis_gt_data['gt_bbox_vis'][global_idx] = self._bbox_curr_to_orig(
+                    self.vis_gt_data['gt_bbox_vis'][global_idx], affine_mm, ori_hw, curr_hw
+                )
+
+            # --- E. 打包 Batch 结果 ---
+            results['ir_match'].append(paddle.to_tensor(batch_res['ir'], dtype='float32') if batch_res['ir'] else paddle.empty([0, 4]))
+            results['vis_match'].append(paddle.to_tensor(batch_res['vis'], dtype='float32') if batch_res['vis'] else paddle.empty([0, 4]))
+            results['cls_match'].append(paddle.to_tensor(batch_res['cls'], dtype='int32') if batch_res['cls'] else paddle.empty([0, 1], dtype='int32'))
+            
+            # 填充 unmatch (当前逻辑下，所有 IR 框都通过 match 或 fallback 处理了，所以归为 match 列表)
+            results['ir_unmatch'].append(paddle.empty([0, 4]))
+            results['vis_unmatch'].append(paddle.empty([0, 4]))
+            
+            # 如果您一定需要第6个返回值 "match的可见光类别"，它其实就是 cls_match
+            results['cls_vis_match'].append(paddle.to_tensor(batch_res['cls'], dtype='int32') if batch_res['cls'] else paddle.empty([0, 1], dtype='int32'))
+
+        return results['ir_match'], results['ir_unmatch'], results['cls_match'], results['vis_match'], results['vis_unmatch']
+    def _eval_with_loader(self, loader, eval_flag=0, my_eval_flag = 'eval_stage3'):
+        sample_num = 0
+        tic = time.time()
+        self._compose_callback.on_epoch_begin(self.status)
+        self.status['mode'] = 'eval'
+
+        test_cfg = self.cfg['test_cfg']
+        if test_cfg['inference_on'] == 'teacher' and eval_flag == 1:
+            logger.info("***** teacher model evaluating *****")
+            eval_model = self.ema.model
+        else:
+            logger.info("***** student model evaluating *****")
+            eval_model = self.model
+
+        eval_model.eval()
+        if self.cfg.get('print_flops', False):
+            flops_loader = create('{}Reader'.format(self.mode.capitalize()))(
+                self.dataset, self.cfg.worker_num, self._eval_batch_sampler)
+            self._flops(flops_loader)
+        for step_id, data in enumerate(loader):
+            self.status['step_id'] = step_id
+            self._compose_callback.on_step_begin(self.status)
+            data['flag'] = my_eval_flag
+            # forward
+            if self.use_amp:
+                with paddle.amp.auto_cast(
+                        enable=self.cfg.use_gpu or self.cfg.use_mlu,
+                        custom_white_list=self.custom_white_list,
+                        custom_black_list=self.custom_black_list,
+                        level=self.amp_level):
+                    outs = eval_model(data)
+            else:
+                outs = eval_model(data)
+
+            # update metrics
+            for metric in self._metrics:
+                metric.update(data, outs)
+
+            # multi-scale inputs: all inputs have same im_id
+            if isinstance(data, typing.Sequence):
+                sample_num += data[0]['im_id'].numpy().shape[0]
+            else:
+                sample_num += data['im_id'].numpy().shape[0]
+            self._compose_callback.on_step_end(self.status)
+
+        self.status['sample_num'] = sample_num
+        self.status['cost_time'] = time.time() - tic
+
+        # accumulate metric to log out
+        for metric in self._metrics:
+            metric.accumulate()
+            metric.log()
+        self._compose_callback.on_epoch_end(self.status)
+        self._reset_metrics()
+
+    def evaluate(self):
+        # get distributed model
+        if self.cfg.get('fleet', False):
+            self.model = fleet.distributed_model(self.model)
+            self.optimizer = fleet.distributed_optimizer(self.optimizer)
+        elif self._nranks > 1:
+            find_unused_parameters = self.cfg[
+                'find_unused_parameters'] if 'find_unused_parameters' in self.cfg else False
+            self.model = paddle.DataParallel(
+                self.model, find_unused_parameters=find_unused_parameters)
+        with paddle.no_grad():
+            self._eval_with_loader(self.loader, 0)
+
+    def _eval_with_loader_slice(self,
+                                loader,
+                                slice_size=[640, 640],
+                                overlap_ratio=[0.25, 0.25],
+                                combine_method='nms',
+                                match_threshold=0.6,
+                                match_metric='iou'):
+        sample_num = 0
+        tic = time.time()
+        self._compose_callback.on_epoch_begin(self.status)
+        self.status['mode'] = 'eval'
+        self.model.eval()
+        if self.cfg.get('print_flops', False):
+            flops_loader = create('{}Reader'.format(self.mode.capitalize()))(
+                self.dataset, self.cfg.worker_num, self._eval_batch_sampler)
+            self._flops(flops_loader)
+
+        merged_bboxs = []
+        for step_id, data in enumerate(loader):
+            self.status['step_id'] = step_id
+            self._compose_callback.on_step_begin(self.status)
+            # forward
+            if self.use_amp:
+                with paddle.amp.auto_cast(
+                        enable=self.cfg.use_gpu or self.cfg.use_npu or
+                        self.cfg.use_mlu,
+                        custom_white_list=self.custom_white_list,
+                        custom_black_list=self.custom_black_list,
+                        level=self.amp_level):
+                    outs = self.model(data)
+            else:
+                outs = self.model(data)
+
+            shift_amount = data['st_pix']
+            outs['bbox'][:, 2:4] = outs['bbox'][:, 2:4] + shift_amount
+            outs['bbox'][:, 4:6] = outs['bbox'][:, 4:6] + shift_amount
+            merged_bboxs.append(outs['bbox'])
+
+            if data['is_last'] > 0:
+                # merge matching predictions
+                merged_results = {'bbox': []}
+                if combine_method == 'nms':
+                    final_boxes = multiclass_nms(
+                        np.concatenate(merged_bboxs), self.cfg.num_classes,
+                        match_threshold, match_metric)
+                    merged_results['bbox'] = np.concatenate(final_boxes)
+                elif combine_method == 'concat':
+                    merged_results['bbox'] = np.concatenate(merged_bboxs)
+                else:
+                    raise ValueError(
+                        "Now only support 'nms' or 'concat' to fuse detection results."
+                    )
+                merged_results['im_id'] = np.array([[0]])
+                merged_results['bbox_num'] = np.array(
+                    [len(merged_results['bbox'])])
+
+                merged_bboxs = []
+                data['im_id'] = data['ori_im_id']
+                # update metrics
+                for metric in self._metrics:
+                    metric.update(data, merged_results)
+
+                # multi-scale inputs: all inputs have same im_id
+                if isinstance(data, typing.Sequence):
+                    sample_num += data[0]['im_id'].numpy().shape[0]
+                else:
+                    sample_num += data['im_id'].numpy().shape[0]
+
+            self._compose_callback.on_step_end(self.status)
+
+        self.status['sample_num'] = sample_num
+        self.status['cost_time'] = time.time() - tic
+
+        # accumulate metric to log out
+        for metric in self._metrics:
+            metric.accumulate()
+            metric.log()
+        self._compose_callback.on_epoch_end(self.status)
+        # reset metric states for metric may performed multiple times
+        self._reset_metrics()
+
+    def evaluate_slice(self,
+                       slice_size=[640, 640],
+                       overlap_ratio=[0.25, 0.25],
+                       combine_method='nms',
+                       match_threshold=0.6,
+                       match_metric='iou'):
+        with paddle.no_grad():
+            self._eval_with_loader_slice(self.loader, slice_size, overlap_ratio,
+                                         combine_method, match_threshold,
+                                         match_metric)
+
+    def slice_predict(self,
+                      images,
+                      slice_size=[640, 640],
+                      overlap_ratio=[0.25, 0.25],
+                      combine_method='nms',
+                      match_threshold=0.6,
+                      match_metric='iou',
+                      draw_threshold=0.5,
+                      output_dir='output',
+                      save_results=False,
+                      visualize=True):
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        self.dataset.set_slice_images(images, slice_size, overlap_ratio)
+        loader = create('TestReader')(self.dataset, 0)
+        imid2path = self.dataset.get_imid2path()
+
+        def setup_metrics_for_loader():
+            # mem
+            metrics = copy.deepcopy(self._metrics)
+            mode = self.mode
+            save_prediction_only = self.cfg[
+                'save_prediction_only'] if 'save_prediction_only' in self.cfg else None
+            output_eval = self.cfg[
+                'output_eval'] if 'output_eval' in self.cfg else None
+
+            # modify
+            self.mode = '_test'
+            self.cfg['save_prediction_only'] = True
+            self.cfg['output_eval'] = output_dir
+            self.cfg['imid2path'] = imid2path
+            self._init_metrics()
+
+            # restore
+            self.mode = mode
+            self.cfg.pop('save_prediction_only')
+            if save_prediction_only is not None:
+                self.cfg['save_prediction_only'] = save_prediction_only
+
+            self.cfg.pop('output_eval')
+            if output_eval is not None:
+                self.cfg['output_eval'] = output_eval
+
+            self.cfg.pop('imid2path')
+
+            _metrics = copy.deepcopy(self._metrics)
+            self._metrics = metrics
+
+            return _metrics
+
+        if save_results:
+            metrics = setup_metrics_for_loader()
+        else:
+            metrics = []
+
+        anno_file = self.dataset.get_anno()
+        clsid2catid, catid2name = get_categories(
+            self.cfg.metric, anno_file=anno_file)
+
+        # Run Infer 
+        self.status['mode'] = 'test'
+        self.model.eval()
+        if self.cfg.get('print_flops', False):
+            flops_loader = create('TestReader')(self.dataset, 0)
+            self._flops(flops_loader)
+
+        results = []  # all images
+        merged_bboxs = []  # single image
+        for step_id, data in enumerate(tqdm(loader)):
+            self.status['step_id'] = step_id
+            # forward
+            outs = self.model(data)
+
+            outs['bbox'] = outs['bbox'].numpy()  # only in test mode
+            shift_amount = data['st_pix']
+            outs['bbox'][:, 2:4] = outs['bbox'][:, 2:4] + shift_amount.numpy()
+            outs['bbox'][:, 4:6] = outs['bbox'][:, 4:6] + shift_amount.numpy()
+            merged_bboxs.append(outs['bbox'])
+
+            if data['is_last'] > 0:
+                # merge matching predictions
+                merged_results = {'bbox': []}
+                if combine_method == 'nms':
+                    final_boxes = multiclass_nms(
+                        np.concatenate(merged_bboxs), self.cfg.num_classes,
+                        match_threshold, match_metric)
+                    merged_results['bbox'] = np.concatenate(final_boxes)
+                elif combine_method == 'concat':
+                    merged_results['bbox'] = np.concatenate(merged_bboxs)
+                else:
+                    raise ValueError(
+                        "Now only support 'nms' or 'concat' to fuse detection results."
+                    )
+                merged_results['im_id'] = np.array([[0]])
+                merged_results['bbox_num'] = np.array(
+                    [len(merged_results['bbox'])])
+
+                merged_bboxs = []
+                data['im_id'] = data['ori_im_id']
+
+                for _m in metrics:
+                    _m.update(data, merged_results)
+
+                for key in ['im_shape', 'scale_factor', 'im_id']:
+                    if isinstance(data, typing.Sequence):
+                        merged_results[key] = data[0][key]
+                    else:
+                        merged_results[key] = data[key]
+                for key, value in merged_results.items():
+                    if hasattr(value, 'numpy'):
+                        merged_results[key] = value.numpy()
+                results.append(merged_results)
+
+        for _m in metrics:
+            _m.accumulate()
+            _m.reset()
+
+        if visualize:
+            for outs in results:
+                batch_res = get_infer_results(outs, clsid2catid)
+                bbox_num = outs['bbox_num']
+
+                start = 0
+                for i, im_id in enumerate(outs['im_id']):
+                    image_path = imid2path[int(im_id)]
+                    image = Image.open(image_path).convert('RGB')
+                    image = ImageOps.exif_transpose(image)
+                    self.status['original_image'] = np.array(image.copy())
+
+                    end = start + bbox_num[i]
+                    bbox_res = batch_res['bbox'][start:end] \
+                            if 'bbox' in batch_res else None
+                    mask_res = batch_res['mask'][start:end] \
+                            if 'mask' in batch_res else None
+                    segm_res = batch_res['segm'][start:end] \
+                            if 'segm' in batch_res else None
+                    keypoint_res = batch_res['keypoint'][start:end] \
+                            if 'keypoint' in batch_res else None
+                    pose3d_res = batch_res['pose3d'][start:end] \
+                            if 'pose3d' in batch_res else None
+                    image = visualize_results(
+                        image, bbox_res, mask_res, segm_res, keypoint_res,
+                        pose3d_res, int(im_id), catid2name, draw_threshold)
+                    self.status['result_image'] = np.array(image.copy())
+                    if self._compose_callback:
+                        self._compose_callback.on_step_end(self.status)
+                    # save image with detection
+                    save_name = self._get_save_image_name(output_dir,
+                                                          image_path)
+                    logger.info("Detection bbox results save in {}".format(
+                        save_name))
+                    image.save(save_name, quality=95)
+
+                    start = end
+
+    def predict(self,
+                images,
+                draw_threshold=0.5,
+                output_dir='output',
+                save_results=False,
+                visualize=True):
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        self.dataset.set_images(images)
+        loader = create('TestReader')(self.dataset, 0)
+
+        imid2path = self.dataset.get_imid2path()
+
+        def setup_metrics_for_loader():
+            # mem
+            metrics = copy.deepcopy(self._metrics)
+            mode = self.mode
+            save_prediction_only = self.cfg[
+                'save_prediction_only'] if 'save_prediction_only' in self.cfg else None
+            output_eval = self.cfg[
+                'output_eval'] if 'output_eval' in self.cfg else None
+
+            # modify
+            self.mode = '_test'
+            self.cfg['save_prediction_only'] = True
+            self.cfg['output_eval'] = output_dir
+            self.cfg['imid2path'] = imid2path
+            self._init_metrics()
+
+            # restore
+            self.mode = mode
+            self.cfg.pop('save_prediction_only')
+            if save_prediction_only is not None:
+                self.cfg['save_prediction_only'] = save_prediction_only
+
+            self.cfg.pop('output_eval')
+            if output_eval is not None:
+                self.cfg['output_eval'] = output_eval
+
+            self.cfg.pop('imid2path')
+
+            _metrics = copy.deepcopy(self._metrics)
+            self._metrics = metrics
+
+            return _metrics
+
+        if save_results:
+            metrics = setup_metrics_for_loader()
+        else:
+            metrics = []
+
+        anno_file = self.dataset.get_anno()
+        clsid2catid, catid2name = get_categories(
+            self.cfg.metric, anno_file=anno_file)
+
+        # Run Infer 
+        self.status['mode'] = 'test'
+        self.model.eval()
+        if self.cfg.get('print_flops', False):
+            flops_loader = create('TestReader')(self.dataset, 0)
+            self._flops(flops_loader)
+        results = []
+        for step_id, data in enumerate(tqdm(loader)):
+            self.status['step_id'] = step_id
+            # forward
+            if hasattr(self.model, 'modelTeacher'):
+                outs = self.model.modelTeacher(data)
+            else:
+                outs = self.model(data)
+            for _m in metrics:
+                _m.update(data, outs)
+
+            for key in ['im_shape', 'scale_factor', 'im_id']:
+                if isinstance(data, typing.Sequence):
+                    outs[key] = data[0][key]
+                else:
+                    outs[key] = data[key]
+            for key, value in outs.items():
+                if hasattr(value, 'numpy'):
+                    outs[key] = value.numpy()
+            results.append(outs)
+
+        # sniper
+        if type(self.dataset) == SniperCOCODataSet:
+            results = self.dataset.anno_cropper.aggregate_chips_detections(
+                results)
+
+        for _m in metrics:
+            _m.accumulate()
+            _m.reset()
+
+        if visualize:
+            for outs in results:
+                batch_res = get_infer_results(outs, clsid2catid)
+                bbox_num = outs['bbox_num']
+
+                start = 0
+                for i, im_id in enumerate(outs['im_id']):
+                    image_path = imid2path[int(im_id)]
+                    image = Image.open(image_path).convert('RGB')
+                    image = ImageOps.exif_transpose(image)
+                    self.status['original_image'] = np.array(image.copy())
+
+                    end = start + bbox_num[i]
+                    bbox_res = batch_res['bbox'][start:end] \
+                            if 'bbox' in batch_res else None
+                    mask_res = batch_res['mask'][start:end] \
+                            if 'mask' in batch_res else None
+                    segm_res = batch_res['segm'][start:end] \
+                            if 'segm' in batch_res else None
+                    keypoint_res = batch_res['keypoint'][start:end] \
+                            if 'keypoint' in batch_res else None
+                    pose3d_res = batch_res['pose3d'][start:end] \
+                            if 'pose3d' in batch_res else None
+                    image = visualize_results(
+                        image, bbox_res, mask_res, segm_res, keypoint_res,
+                        pose3d_res, int(im_id), catid2name, draw_threshold)
+                    self.status['result_image'] = np.array(image.copy())
+                    if self._compose_callback:
+                        self._compose_callback.on_step_end(self.status)
+                    # save image with detection
+                    save_name = self._get_save_image_name(output_dir,
+                                                          image_path)
+                    logger.info("Detection bbox results save in {}".format(
+                        save_name))
+                    image.save(save_name, quality=95)
+
+                    start = end
+        return results
+
+    def multi_predict_paired(self,
+                vis_images,
+                ir_images,
+                draw_threshold=0.5,
+                output_dir='output',
+                save_results=False,
+                visualize=True):
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        self.dataset.set_images(vis_images,ir_images)
+        loader = create('TestReader')(self.dataset, 0)
+
+        imid2path = self.dataset.get_imid2path()
+
+        def setup_metrics_for_loader():
+            # mem
+            metrics = copy.deepcopy(self._metrics)
+            mode = self.mode
+            save_prediction_only = self.cfg[
+                'save_prediction_only'] if 'save_prediction_only' in self.cfg else None
+            output_eval = self.cfg[
+                'output_eval'] if 'output_eval' in self.cfg else None
+
+            # modify
+            self.mode = '_test'
+            self.cfg['save_prediction_only'] = True
+            self.cfg['output_eval'] = output_dir
+            self.cfg['imid2path'] = imid2path
+            self._init_metrics()
+
+            # restore
+            self.mode = mode
+            self.cfg.pop('save_prediction_only')
+            if save_prediction_only is not None:
+                self.cfg['save_prediction_only'] = save_prediction_only
+
+            self.cfg.pop('output_eval')
+            if output_eval is not None:
+                self.cfg['output_eval'] = output_eval
+
+            self.cfg.pop('imid2path')
+
+            _metrics = copy.deepcopy(self._metrics)
+            self._metrics = metrics
+
+            return _metrics
+
+        if save_results:
+            metrics = setup_metrics_for_loader()
+        else:
+            metrics = []
+
+        anno_file = self.dataset.get_anno()
+        clsid2catid, catid2name = get_categories(
+            self.cfg.metric, anno_file=anno_file)
+
+        # Run Infer
+        self.status['mode'] = 'test'
+        self.model.eval()
+        if self.cfg.get('print_flops', False):
+            flops_loader = create('TestReader')(self.dataset, 0)
+            self._flops(flops_loader)
+        results = []
+        for step_id, data in enumerate(tqdm(loader)):
+            self.status['step_id'] = step_id
+            data['flag'] = 'infer_paired'
+            # forward
+            if hasattr(self.model, 'modelTeacher'):
+                outs = self.model.modelTeacher(data)
+            else:
+                outs = self.model(data)
+            for _m in metrics:
+                _m.update(data, outs)
+
+            for key in ['im_shape', 'scale_factor', 'im_id']:
+                if isinstance(data, typing.Sequence):
+                    outs[key] = data[0][key]
+                else:
+                    outs[key] = data[key]
+            for key, value in outs.items():
+                if hasattr(value, 'numpy'):
+                    outs[key] = value.numpy()
+            results.append(outs)
+
+        # sniper
+        if type(self.dataset) == SniperCOCODataSet:
+            results = self.dataset.anno_cropper.aggregate_chips_detections(
+                results)
+
+        for _m in metrics:
+            _m.accumulate()
+            _m.reset()
+
+        if visualize:
+            for outs in results:
+                batch_res = get_infer_results(outs, clsid2catid)
+                bbox_num = outs['bbox_num']
+
+                start = 0
+                for i, im_id in enumerate(outs['im_id']):
+                    vis_image_path = imid2path[int(im_id)][0]
+                    ir_image_path = imid2path[int(im_id)][1]
+                    vis_image = Image.open(vis_image_path).convert('RGB')
+                    ir_image = Image.open(ir_image_path).convert('RGB')
+                    vis_image = ImageOps.exif_transpose(vis_image)
+                    ir_image = ImageOps.exif_transpose(ir_image)
+                    self.status['original_vis_image'] = np.array(vis_image.copy())
+                    self.status['original_ir_image'] = np.array(ir_image.copy())
+                    end = start + bbox_num[i]
+                    bbox_res_vis = batch_res['bbox_vis'][start:end] \
+                            if 'bbox_vis' in batch_res else None
+                    bbox_res_ir = batch_res['bbox_ir'][start:end] \
+                        if 'bbox_ir' in batch_res else None
+                    mask_res = batch_res['mask'][start:end] \
+                            if 'mask' in batch_res else None
+                    segm_res = batch_res['segm'][start:end] \
+                            if 'segm' in batch_res else None
+                    keypoint_res = batch_res['keypoint'][start:end] \
+                            if 'keypoint' in batch_res else None
+                    pose3d_res = batch_res['pose3d'][start:end] \
+                            if 'pose3d' in batch_res else None
+                    vis_image = visualize_results_paired(
+                        vis_image, bbox_res_vis, mask_res, segm_res, keypoint_res,
+                        pose3d_res, int(im_id), catid2name, draw_threshold)
+
+                    ir_image = visualize_results_paired(
+                        ir_image, bbox_res_ir, mask_res, segm_res, keypoint_res,
+                        pose3d_res, int(im_id), catid2name, draw_threshold)
+
+                    self.status['result_vis_image'] = np.array(vis_image.copy())
+                    self.status['result_ir_image'] = np.array(ir_image.copy())
+                    if self._compose_callback:
+                        self._compose_callback.on_step_end(self.status)
+                    # save image with detection
+                    save_vis_name = self._get_save_vis_image_name(output_dir,
+                                                          vis_image_path)
+                    save_ir_name = self._get_save_ir_image_name(output_dir,
+                                                                ir_image_path)
+                    logger.info("Detection bbox results save in {}".format(
+                        save_vis_name+' '+save_ir_name))
+                    vis_image.save(save_vis_name, quality=95)
+                    ir_image.save(save_ir_name, quality=95)
+                    start = end
+        return results
+
+    def multi_predict(self,
+                vis_images,
+                ir_images,
+                draw_threshold=0.5,
+                output_dir='output',
+                save_results=False,
+                visualize=True):
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        self.dataset.set_images(vis_images,ir_images)
+        loader = create('TestReader')(self.dataset, 0)
+
+        imid2path = self.dataset.get_imid2path()
+
+        def setup_metrics_for_loader():
+            # mem
+            metrics = copy.deepcopy(self._metrics)
+            mode = self.mode
+            save_prediction_only = self.cfg[
+                'save_prediction_only'] if 'save_prediction_only' in self.cfg else None
+            output_eval = self.cfg[
+                'output_eval'] if 'output_eval' in self.cfg else None
+
+            # modify
+            self.mode = '_test'
+            self.cfg['save_prediction_only'] = True
+            self.cfg['output_eval'] = output_dir
+            self.cfg['imid2path'] = imid2path
+            self._init_metrics()
+
+            # restore
+            self.mode = mode
+            self.cfg.pop('save_prediction_only')
+            if save_prediction_only is not None:
+                self.cfg['save_prediction_only'] = save_prediction_only
+
+            self.cfg.pop('output_eval')
+            if output_eval is not None:
+                self.cfg['output_eval'] = output_eval
+
+            self.cfg.pop('imid2path')
+
+            _metrics = copy.deepcopy(self._metrics)
+            self._metrics = metrics
+
+            return _metrics
+
+        if save_results:
+            metrics = setup_metrics_for_loader()
+        else:
+            metrics = []
+
+        anno_file = self.dataset.get_anno()
+        clsid2catid, catid2name = get_categories(
+            self.cfg.metric, anno_file=anno_file)
+
+        # Run Infer
+        self.status['mode'] = 'test'
+        self.model.eval()
+        if self.cfg.get('print_flops', False):
+            flops_loader = create('TestReader')(self.dataset, 0)
+            self._flops(flops_loader)
+        results = []
+        for step_id, data in enumerate(tqdm(loader)):
+            self.status['step_id'] = step_id
+            # forward
+            if hasattr(self.model, 'modelTeacher'):
+                outs = self.model.modelTeacher(data)
+            else:
+                outs = self.model(data)
+            for _m in metrics:
+                _m.update(data, outs)
+
+            for key in ['im_shape', 'scale_factor', 'im_id']:
+                if isinstance(data, typing.Sequence):
+                    outs[key] = data[0][key]
+                else:
+                    outs[key] = data[key]
+            for key, value in outs.items():
+                if hasattr(value, 'numpy'):
+                    outs[key] = value.numpy()
+            results.append(outs)
+
+        # sniper
+        if type(self.dataset) == SniperCOCODataSet:
+            results = self.dataset.anno_cropper.aggregate_chips_detections(
+                results)
+
+        for _m in metrics:
+            _m.accumulate()
+            _m.reset()
+
+        if visualize:
+            for outs in results:
+                batch_res = get_infer_results(outs, clsid2catid)
+                bbox_num = outs['bbox_num']
+
+                start = 0
+                for i, im_id in enumerate(outs['im_id']):
+                    vis_image_path = imid2path[int(im_id)][0]
+                    ir_image_path = imid2path[int(im_id)][1]
+                    vis_image = Image.open(vis_image_path).convert('RGB')
+                    ir_image = Image.open(ir_image_path).convert('RGB')
+                    vis_image = ImageOps.exif_transpose(vis_image)
+                    ir_image = ImageOps.exif_transpose(ir_image)
+                    self.status['original_vis_image'] = np.array(vis_image.copy())
+                    self.status['original_ir_image'] = np.array(ir_image.copy())
+                    end = start + bbox_num[i]
+                    bbox_res = batch_res['bbox'][start:end] \
+                            if 'bbox' in batch_res else None
+                    mask_res = batch_res['mask'][start:end] \
+                            if 'mask' in batch_res else None
+                    segm_res = batch_res['segm'][start:end] \
+                            if 'segm' in batch_res else None
+                    keypoint_res = batch_res['keypoint'][start:end] \
+                            if 'keypoint' in batch_res else None
+                    pose3d_res = batch_res['pose3d'][start:end] \
+                            if 'pose3d' in batch_res else None
+                    vis_image = visualize_results(
+                        vis_image, bbox_res, mask_res, segm_res, keypoint_res,
+                        pose3d_res, int(im_id), catid2name, draw_threshold)
+
+                    ir_image = visualize_results(
+                        ir_image, bbox_res, mask_res, segm_res, keypoint_res,
+                        pose3d_res, int(im_id), catid2name, draw_threshold)
+
+                    self.status['result_vis_image'] = np.array(vis_image.copy())
+                    self.status['result_ir_image'] = np.array(ir_image.copy())
+                    if self._compose_callback:
+                        self._compose_callback.on_step_end(self.status)
+                    # save image with detection
+                    save_vis_name = self._get_save_vis_image_name(output_dir,
+                                                          vis_image_path)
+                    save_ir_name = self._get_save_ir_image_name(output_dir,
+                                                                ir_image_path)
+                    logger.info("Detection bbox results save in {}".format(
+                        save_vis_name+' '+save_ir_name))
+                    vis_image.save(save_vis_name, quality=95)
+                    ir_image.save(save_ir_name, quality=95)
+                    start = end
+        return results
+
+
+    def _get_save_image_name(self, output_dir, image_path):
+        """
+        Get save image name from source image path.
+        """
+        image_name = os.path.split(image_path)[-1]
+        name, ext = os.path.splitext(image_name)
+        return os.path.join(output_dir, "{}".format(name)) + ext
+
+    def _get_save_vis_image_name(self, output_dir, image_path):
+        """
+        Get save image name from source image path.
+        """
+        image_name = os.path.split(image_path)[-1]
+        name, ext = os.path.splitext(image_name)
+        return os.path.join(output_dir, "{}".format(name)+'_vis') + ext
+
+    def _get_save_ir_image_name(self, output_dir, image_path):
+        """
+        Get save image name from source image path.
+        """
+        image_name = os.path.split(image_path)[-1]
+        name, ext = os.path.splitext(image_name)
+        return os.path.join(output_dir, "{}".format(name)+'_ir') + ext
+
+    def _get_infer_cfg_and_input_spec(self,
+                                      save_dir,
+                                      prune_input=True,
+                                      kl_quant=False):
+        image_shape = None
+        im_shape = [None, 2]
+        scale_factor = [None, 2]
+        if self.cfg.architecture in MOT_ARCH:
+            test_reader_name = 'TestMOTReader'
+        else:
+            test_reader_name = 'TestReader'
+        if 'inputs_def' in self.cfg[test_reader_name]:
+            inputs_def = self.cfg[test_reader_name]['inputs_def']
+            image_shape = inputs_def.get('image_shape', None)
+        # set image_shape=[None, 3, -1, -1] as default
+        if image_shape is None:
+            image_shape = [None, 3, -1, -1]
+
+        if len(image_shape) == 3:
+            image_shape = [None] + image_shape
+        else:
+            im_shape = [image_shape[0], 2]
+            scale_factor = [image_shape[0], 2]
+
+        if hasattr(self.model, 'deploy'):
+            self.model.deploy = True
+
+        if 'slim' not in self.cfg:
+            for layer in self.model.sublayers():
+                if hasattr(layer, 'convert_to_deploy'):
+                    layer.convert_to_deploy()
+
+        if hasattr(self.cfg, 'export') and 'fuse_conv_bn' in self.cfg[
+                'export'] and self.cfg['export']['fuse_conv_bn']:
+            self.model = fuse_conv_bn(self.model)
+
+        export_post_process = self.cfg['export'].get(
+            'post_process', False) if hasattr(self.cfg, 'export') else True
+        export_nms = self.cfg['export'].get('nms', False) if hasattr(
+            self.cfg, 'export') else True
+        export_benchmark = self.cfg['export'].get(
+            'benchmark', False) if hasattr(self.cfg, 'export') else False
+        if hasattr(self.model, 'fuse_norm'):
+            self.model.fuse_norm = self.cfg['TestReader'].get('fuse_normalize',
+                                                              False)
+        if hasattr(self.model, 'export_post_process'):
+            self.model.export_post_process = export_post_process if not export_benchmark else False
+        if hasattr(self.model, 'export_nms'):
+            self.model.export_nms = export_nms if not export_benchmark else False
+        if export_post_process and not export_benchmark:
+            image_shape = [None] + image_shape[1:]
+
+        # Save infer cfg
+        _dump_infer_config(self.cfg,
+                           os.path.join(save_dir, 'infer_cfg.yml'), image_shape,
+                           self.model)
+
+        input_spec = [{
+            "image": InputSpec(
+                shape=image_shape, name='image'),
+            "im_shape": InputSpec(
+                shape=im_shape, name='im_shape'),
+            "scale_factor": InputSpec(
+                shape=scale_factor, name='scale_factor')
+        }]
+        if self.cfg.architecture == 'DeepSORT':
+            input_spec[0].update({
+                "crops": InputSpec(
+                    shape=[None, 3, 192, 64], name='crops')
+            })
+        if prune_input:
+            static_model = paddle.jit.to_static(
+                self.model, input_spec=input_spec)
+            # NOTE: dy2st do not pruned program, but jit.save will prune program
+            # input spec, prune input spec here and save with pruned input spec
+            pruned_input_spec = _prune_input_spec(
+                input_spec, static_model.forward.main_program,
+                static_model.forward.outputs)
+        else:
+            static_model = None
+            pruned_input_spec = input_spec
+
+        # TODO: Hard code, delete it when support prune input_spec.
+        if self.cfg.architecture == 'PicoDet' and not export_post_process:
+            pruned_input_spec = [{
+                "image": InputSpec(
+                    shape=image_shape, name='image')
+            }]
+        if kl_quant:
+            if self.cfg.architecture == 'PicoDet' or 'ppyoloe' in self.cfg.weights:
+                pruned_input_spec = [{
+                    "image": InputSpec(
+                        shape=image_shape, name='image'),
+                    "scale_factor": InputSpec(
+                        shape=scale_factor, name='scale_factor')
+                }]
+            elif 'tinypose' in self.cfg.weights:
+                pruned_input_spec = [{
+                    "image": InputSpec(
+                        shape=image_shape, name='image')
+                }]
+
+        return static_model, pruned_input_spec
+
+    def export(self, output_dir='output_inference'):
+        if hasattr(self.model, 'aux_neck'):
+            self.model.__delattr__('aux_neck')
+        if hasattr(self.model, 'aux_head'):
+            self.model.__delattr__('aux_head')
+        self.model.eval()
+
+        model_name = os.path.splitext(os.path.split(self.cfg.filename)[-1])[0]
+        save_dir = os.path.join(output_dir, model_name)
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        static_model, pruned_input_spec = self._get_infer_cfg_and_input_spec(
+            save_dir)
+
+        # dy2st and save model
+        if 'slim' not in self.cfg or 'QAT' not in self.cfg['slim_type']:
+            paddle.jit.save(
+                static_model,
+                os.path.join(save_dir, 'model'),
+                input_spec=pruned_input_spec)
+        else:
+            self.cfg.slim.save_quantized_model(
+                self.model,
+                os.path.join(save_dir, 'model'),
+                input_spec=pruned_input_spec)
+        logger.info("Export model and saved in {}".format(save_dir))
+
+    def post_quant(self, output_dir='output_inference'):
+        model_name = os.path.splitext(os.path.split(self.cfg.filename)[-1])[0]
+        save_dir = os.path.join(output_dir, model_name)
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        for idx, data in enumerate(self.loader):
+            self.model(data)
+            if idx == int(self.cfg.get('quant_batch_num', 10)):
+                break
+
+        # TODO: support prune input_spec
+        kl_quant = True if hasattr(self.cfg.slim, 'ptq') else False
+        _, pruned_input_spec = self._get_infer_cfg_and_input_spec(
+            save_dir, prune_input=False, kl_quant=kl_quant)
+
+        self.cfg.slim.save_quantized_model(
+            self.model,
+            os.path.join(save_dir, 'model'),
+            input_spec=pruned_input_spec)
+        logger.info("Export Post-Quant model and saved in {}".format(save_dir))
+
+    def _flops(self, loader):
+        if hasattr(self.model, 'aux_neck'):
+            self.model.__delattr__('aux_neck')
+        if hasattr(self.model, 'aux_head'):
+            self.model.__delattr__('aux_head')
+        self.model.eval()
+        try:
+            import paddleslim
+        except Exception as e:
+            logger.warning(
+                'Unable to calculate flops, please install paddleslim, for example: `pip install paddleslim`'
+            )
+            return
+
+        from paddleslim.analysis import dygraph_flops as flops
+        input_data = None
+        for data in loader:
+            input_data = data
+            break
+
+        input_spec = [{
+            "vis_image": input_data['vis_image'][0].unsqueeze(0),
+            "ir_image": input_data['ir_image'][0].unsqueeze(0),
+            "im_shape": input_data['im_shape'][0].unsqueeze(0),
+            "scale_factor": input_data['scale_factor'][0].unsqueeze(0)
+        }]
+
+        # input_spec = [{
+        #     "image": input_data['image'][0].unsqueeze(0),
+        #     "im_shape": input_data['im_shape'][0].unsqueeze(0),
+        #     "scale_factor": input_data['scale_factor'][0].unsqueeze(0)
+        # }]
+        # flops = flops(self.model, input_spec) / (1000**3)
+        # logger.info(" Model FLOPs : {:.6f}G. (image shape is {})".format(
+        #     flops, input_data['image'][0].unsqueeze(0).shape))
+
+    def parse_mot_images(self, cfg):
+        import glob
+        # for quant
+        dataset_dir = cfg['EvalMOTDataset'].dataset_dir
+        data_root = cfg['EvalMOTDataset'].data_root
+        data_root = '{}/{}'.format(dataset_dir, data_root)
+        seqs = os.listdir(data_root)
+        seqs.sort()
+        all_images = []
+        for seq in seqs:
+            infer_dir = os.path.join(data_root, seq)
+            assert infer_dir is None or os.path.isdir(infer_dir), \
+                "{} is not a directory".format(infer_dir)
+            images = set()
+            exts = ['jpg', 'jpeg', 'png', 'bmp']
+            exts += [ext.upper() for ext in exts]
+            for ext in exts:
+                images.update(glob.glob('{}/*.{}'.format(infer_dir, ext)))
+            images = list(images)
+            images.sort()
+            assert len(images) > 0, "no image found in {}".format(infer_dir)
+            all_images.extend(images)
+            logger.info("Found {} inference images in total.".format(
+                len(images)))
+        return all_images

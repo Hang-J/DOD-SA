@@ -1,0 +1,3101 @@
+# Copyright (c) 2021 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
+from ppdet.core.workspace import register
+from ..losses.probiou_loss import ProbIoULoss
+from .iou_loss import GIoULoss
+from ..transformers import bbox_cxcywh_to_xyxy, sigmoid_focal_loss, varifocal_loss_with_logits
+from ..bbox_utils import bbox_iou
+from ext_op import matched_rbox_iou
+import numpy as np
+
+__all__ = ['DETRLoss', 'DINOLoss', 'DINOLoss_Paired', 'DETRLoss_Paired', 'DINOLoss_Rotate', 'DETRLoss_Rotate','DINOLoss_Rotate_Paired',
+           'DETRLoss_Rotate_Paired']
+
+
+@register
+class DETRLoss(nn.Layer):
+    __shared__ = ['num_classes', 'use_focal_loss']
+    __inject__ = ['matcher']
+
+    def __init__(self,
+                 num_classes=80,
+                 matcher='HungarianMatcher',
+                 loss_coeff={
+                     'class': 1,
+                     'bbox': 5,
+                     'giou': 2,
+                     'no_object': 0.1,
+                     'mask': 1,
+                     'dice': 1
+                 },
+                 aux_loss=True,
+                 use_focal_loss=False,
+                 use_vfl=False,
+                 use_uni_match=False,
+                 group=False,
+                 groupx4=False,
+                 groupx5=False,
+                 groupx3_v3=False,
+                 groupx3_v4=False,
+                 groupx3_v5=False,
+                 groupx3_v6=False,
+                 uni_match_ind=0):
+        r"""
+        Args:
+            num_classes (int): The number of classes.
+            matcher (HungarianMatcher): It computes an assignment between the targets
+                and the predictions of the network.
+            loss_coeff (dict): The coefficient of loss.
+            aux_loss (bool): If 'aux_loss = True', loss at each decoder layer are to be used.
+            use_focal_loss (bool): Use focal loss or not.
+        """
+        super(DETRLoss, self).__init__()
+
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.loss_coeff = loss_coeff
+        self.aux_loss = aux_loss
+        self.use_focal_loss = use_focal_loss
+        self.use_vfl = use_vfl
+        self.use_uni_match = use_uni_match
+        self.uni_match_ind = uni_match_ind
+        self.group = group
+        self.groupx4 = groupx4
+        self.groupx5 = groupx5
+        self.groupx3_v3 = groupx3_v3
+        self.groupx3_v4 = groupx3_v4
+        self.groupx3_v5 = groupx3_v5
+        self.groupx3_v6 = groupx3_v6
+
+        if not self.use_focal_loss:
+            self.loss_coeff['class'] = paddle.full([num_classes + 1],
+                                                   loss_coeff['class'])
+            self.loss_coeff['class'][-1] = loss_coeff['no_object']
+        self.giou_loss = GIoULoss()
+        #self.piou_loss = ProbIoULoss()
+
+    def _get_loss_class(self,
+                        logits,
+                        gt_class,
+                        match_indices,
+                        bg_index,
+                        num_gts,
+                        postfix="",
+                        iou_score=None):
+        # logits: [b, query, num_classes], gt_class: list[[n, 1]]
+        name_class = "loss_class" + postfix
+
+        target_label = paddle.full(logits.shape[:2], bg_index, dtype='int64')
+        bs, num_query_objects = target_label.shape
+        num_gt = sum(len(a) for a in gt_class)
+        if num_gt > 0:
+            index, updates = self._get_index_updates(num_query_objects,
+                                                     gt_class, match_indices)
+            target_label = paddle.scatter(
+                target_label.reshape([-1, 1]), index, updates.astype('int64'))
+            target_label = target_label.reshape([bs, num_query_objects])
+        if self.use_focal_loss:
+            target_label = F.one_hot(target_label,
+                                     self.num_classes + 1)[..., :-1]
+            if iou_score is not None and self.use_vfl:
+                target_score = paddle.zeros([bs, num_query_objects])
+                if num_gt > 0:
+                    target_score = paddle.scatter(
+                        target_score.reshape([-1, 1]), index, iou_score)
+                target_score = target_score.reshape(
+                    [bs, num_query_objects, 1]) * target_label
+                loss_ = self.loss_coeff['class'] * varifocal_loss_with_logits(
+                    logits, target_score, target_label,
+                    num_gts / num_query_objects)
+            else:
+                loss_ = self.loss_coeff['class'] * sigmoid_focal_loss(
+                    logits, target_label, num_gts / num_query_objects)
+        else:
+            loss_ = F.cross_entropy(
+                logits, target_label, weight=self.loss_coeff['class'])
+        return {name_class: loss_}
+
+    def _get_loss_bbox(self, boxes, gt_bbox, match_indices, num_gts,
+                       postfix=""):
+        # boxes: [b, query, 4], gt_bbox: list[[n, 4]]
+        name_bbox = "loss_bbox" + postfix
+        name_giou = "loss_giou" + postfix
+
+        loss = dict()
+        if sum(len(a) for a in gt_bbox) == 0:
+            loss[name_bbox] = paddle.to_tensor([0.])
+            loss[name_giou] = paddle.to_tensor([0.])
+            return loss
+
+        src_bbox, target_bbox = self._get_src_target_assign(boxes, gt_bbox,
+                                                            match_indices)
+        loss[name_bbox] = self.loss_coeff['bbox'] * F.l1_loss(
+            src_bbox, target_bbox, reduction='sum') / num_gts
+        loss[name_giou] = self.giou_loss(
+            bbox_cxcywh_to_xyxy(src_bbox), bbox_cxcywh_to_xyxy(target_bbox))
+        loss[name_giou] = loss[name_giou].sum() / num_gts
+        loss[name_giou] = self.loss_coeff['giou'] * loss[name_giou]
+        return loss
+
+    def _get_loss_mask(self, masks, gt_mask, match_indices, num_gts,
+                       postfix=""):
+        # masks: [b, query, h, w], gt_mask: list[[n, H, W]]
+        name_mask = "loss_mask" + postfix
+        name_dice = "loss_dice" + postfix
+
+        loss = dict()
+        if sum(len(a) for a in gt_mask) == 0:
+            loss[name_mask] = paddle.to_tensor([0.])
+            loss[name_dice] = paddle.to_tensor([0.])
+            return loss
+
+        src_masks, target_masks = self._get_src_target_assign(masks, gt_mask,
+                                                              match_indices)
+        src_masks = F.interpolate(
+            src_masks.unsqueeze(0),
+            size=target_masks.shape[-2:],
+            mode="bilinear")[0]
+        loss[name_mask] = self.loss_coeff['mask'] * F.sigmoid_focal_loss(
+            src_masks,
+            target_masks,
+            paddle.to_tensor(
+                [num_gts], dtype='float32'))
+        loss[name_dice] = self.loss_coeff['dice'] * self._dice_loss(
+            src_masks, target_masks, num_gts)
+        return loss
+
+    def _dice_loss(self, inputs, targets, num_gts):
+        inputs = F.sigmoid(inputs)
+        inputs = inputs.flatten(1)
+        targets = targets.flatten(1)
+        numerator = 2 * (inputs * targets).sum(1)
+        denominator = inputs.sum(-1) + targets.sum(-1)
+        loss = 1 - (numerator + 1) / (denominator + 1)
+        return loss.sum() / num_gts
+
+    def _get_loss_aux(self,
+                      boxes,
+                      logits,
+                      gt_bbox,
+                      gt_class,
+                      bg_index,
+                      num_gts,
+                      dn_match_indices=None,
+                      postfix="",
+                      masks=None,
+                      gt_mask=None):
+        loss_class = []
+        loss_bbox, loss_giou = [], []
+        loss_mask, loss_dice = [], []
+        if dn_match_indices is not None:
+            match_indices = dn_match_indices
+        elif self.use_uni_match:
+            match_indices = self.matcher(
+                boxes[self.uni_match_ind],
+                logits[self.uni_match_ind],
+                gt_bbox,
+                gt_class,
+                masks=masks[self.uni_match_ind] if masks is not None else None,
+                gt_mask=gt_mask)
+        for i, (aux_boxes, aux_logits) in enumerate(zip(boxes, logits)):
+            aux_masks = masks[i] if masks is not None else None
+            if not self.use_uni_match and dn_match_indices is None:
+                match_indices = self.matcher(
+                    aux_boxes,
+                    aux_logits,
+                    gt_bbox,
+                    gt_class,
+                    masks=aux_masks,
+                    gt_mask=gt_mask)
+            if self.use_vfl:
+                if sum(len(a) for a in gt_bbox) > 0:
+                    src_bbox, target_bbox = self._get_src_target_assign(
+                        aux_boxes.detach(), gt_bbox, match_indices)
+                    iou_score = bbox_iou(
+                        bbox_cxcywh_to_xyxy(src_bbox).split(4, -1),
+                        bbox_cxcywh_to_xyxy(target_bbox).split(4, -1))
+                else:
+                    iou_score = None
+            else:
+                iou_score = None
+            loss_class.append(
+                self._get_loss_class(aux_logits, gt_class, match_indices,
+                                     bg_index, num_gts, postfix, iou_score)[
+                                         'loss_class' + postfix])
+            loss_ = self._get_loss_bbox(aux_boxes, gt_bbox, match_indices,
+                                        num_gts, postfix)
+            loss_bbox.append(loss_['loss_bbox' + postfix])
+            loss_giou.append(loss_['loss_giou' + postfix])
+            if masks is not None and gt_mask is not None:
+                loss_ = self._get_loss_mask(aux_masks, gt_mask, match_indices,
+                                            num_gts, postfix)
+                loss_mask.append(loss_['loss_mask' + postfix])
+                loss_dice.append(loss_['loss_dice' + postfix])
+        loss = {
+            "loss_class_aux" + postfix: paddle.add_n(loss_class),
+            "loss_bbox_aux" + postfix: paddle.add_n(loss_bbox),
+            "loss_giou_aux" + postfix: paddle.add_n(loss_giou)
+        }
+        if masks is not None and gt_mask is not None:
+            loss["loss_mask_aux" + postfix] = paddle.add_n(loss_mask)
+            loss["loss_dice_aux" + postfix] = paddle.add_n(loss_dice)
+        return loss
+
+    def _get_index_updates(self, num_query_objects, target, match_indices):
+        batch_idx = paddle.concat([
+            paddle.full_like(src, i) for i, (src, _) in enumerate(match_indices)
+        ])
+        src_idx = paddle.concat([src for (src, _) in match_indices])
+        src_idx += (batch_idx * num_query_objects)
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, dst, axis=0) for t, (_, dst) in zip(target, match_indices)
+        ])
+        return src_idx, target_assign
+
+    def _get_src_target_assign(self, src, target, match_indices):
+        src_assign = paddle.concat([
+            paddle.gather(
+                t, I, axis=0) if len(I) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (I, _) in zip(src, match_indices)
+        ])
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, J, axis=0) if len(J) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (_, J) in zip(target, match_indices)
+        ])
+        return src_assign, target_assign
+
+    def _get_num_gts(self, targets, dtype="float32"):
+        num_gts = sum(len(a) for a in targets)
+        num_gts = paddle.to_tensor([num_gts], dtype=dtype)
+        if paddle.distributed.get_world_size() > 1:
+            paddle.distributed.all_reduce(num_gts)
+            num_gts /= paddle.distributed.get_world_size()
+        num_gts = paddle.clip(num_gts, min=1.)
+        return num_gts
+
+    def _get_prediction_loss(self,
+                             boxes,
+                             logits,
+                             gt_bbox,
+                             gt_class,
+                             masks=None,
+                             gt_mask=None,
+                             postfix="",
+                             dn_match_indices=None,
+                             num_gts=1):
+        if dn_match_indices is None:
+            match_indices = self.matcher(
+                boxes, logits, gt_bbox, gt_class, masks=masks, gt_mask=gt_mask)
+        else:
+            match_indices = dn_match_indices
+
+        if self.use_vfl:
+            if sum(len(a) for a in gt_bbox) > 0:
+                src_bbox, target_bbox = self._get_src_target_assign(
+                    boxes.detach(), gt_bbox, match_indices)
+                iou_score = bbox_iou(
+                    bbox_cxcywh_to_xyxy(src_bbox).split(4, -1),
+                    bbox_cxcywh_to_xyxy(target_bbox).split(4, -1))
+            else:
+                iou_score = None
+        else:
+            iou_score = None
+
+        loss = dict()
+        loss.update(
+            self._get_loss_class(logits, gt_class, match_indices,
+                                 self.num_classes, num_gts, postfix, iou_score))
+        loss.update(
+            self._get_loss_bbox(boxes, gt_bbox, match_indices, num_gts,
+                                postfix))
+        if masks is not None and gt_mask is not None:
+            loss.update(
+                self._get_loss_mask(masks, gt_mask, match_indices, num_gts,
+                                    postfix))
+        return loss
+
+    def forward(self,
+                boxes,
+                logits,
+                gt_bbox,
+                gt_class,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                **kwargs):
+        r"""
+        Args:
+            boxes (Tensor): [l, b, query, 4]
+            logits (Tensor): [l, b, query, num_classes]
+            gt_bbox (List(Tensor)): list[[n, 4]]
+            gt_class (List(Tensor)): list[[n, 1]]
+            masks (Tensor, optional): [l, b, query, h, w]
+            gt_mask (List(Tensor), optional): list[[n, H, W]]
+            postfix (str): postfix of loss name
+        """
+
+        dn_match_indices = kwargs.get("dn_match_indices", None)
+        num_gts = kwargs.get("num_gts", None)
+        if num_gts is None:
+            num_gts = self._get_num_gts(gt_class)
+
+        total_loss = self._get_prediction_loss(
+            boxes[-1],
+            logits[-1],
+            gt_bbox,
+            gt_class,
+            masks=masks[-1] if masks is not None else None,
+            gt_mask=gt_mask,
+            postfix=postfix,
+            dn_match_indices=dn_match_indices,
+            num_gts=num_gts)
+
+        if self.aux_loss:
+            total_loss.update(
+                self._get_loss_aux(
+                    boxes[:-1],
+                    logits[:-1],
+                    gt_bbox,
+                    gt_class,
+                    self.num_classes,
+                    num_gts,
+                    dn_match_indices,
+                    postfix,
+                    masks=masks[:-1] if masks is not None else None,
+                    gt_mask=gt_mask))
+
+        return total_loss
+
+
+@register
+class DETRLoss_Rotate(nn.Layer):
+    __shared__ = ['num_classes', 'use_focal_loss']
+    __inject__ = ['matcher']
+
+    def __init__(self,
+                 num_classes=80,
+                 matcher='HungarianMatcher_Rotate',
+                 loss_coeff={
+                     'class': 1,
+                     'bbox': 5,
+                     'giou': 2,
+                     'no_object': 0.1,
+                     'mask': 1,
+                     'dice': 1
+                 },
+                 aux_loss=True,
+                 use_focal_loss=False,
+                 use_vfl=False,
+                 use_uni_match=False,
+                 group=False,
+                 groupx4=False,
+                 groupx5=False,
+                 groupx3_v3=False,
+                 groupx3_v4=False,
+                 groupx3_v5=False,
+                 groupx3_v6=False,
+                 uni_match_ind=0):
+        r"""
+        Args:
+            num_classes (int): The number of classes.
+            matcher (HungarianMatcher): It computes an assignment between the targets
+                and the predictions of the network.
+            loss_coeff (dict): The coefficient of loss.
+            aux_loss (bool): If 'aux_loss = True', loss at each decoder layer are to be used.
+            use_focal_loss (bool): Use focal loss or not.
+        """
+        super(DETRLoss_Rotate, self).__init__()
+
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.loss_coeff = loss_coeff
+        self.aux_loss = aux_loss
+        self.use_focal_loss = use_focal_loss
+        self.use_vfl = use_vfl
+        self.use_uni_match = use_uni_match
+        self.uni_match_ind = uni_match_ind
+        self.group = group
+        self.groupx4 = groupx4
+        self.groupx5 = groupx5
+        self.groupx3_v3 = groupx3_v3
+        self.groupx3_v4 = groupx3_v4
+        self.groupx3_v5 = groupx3_v5
+        self.groupx3_v6 = groupx3_v6
+        self.half_pi = paddle.to_tensor(
+            [1.5707963267948966], dtype=paddle.float32)
+        self.angle_max = 90
+        self.half_pi_bin = self.half_pi / self.angle_max
+
+        if not self.use_focal_loss:
+            self.loss_coeff['class'] = paddle.full([num_classes + 1],
+                                                   loss_coeff['class'])
+            self.loss_coeff['class'][-1] = loss_coeff['no_object']
+        #self.giou_loss = GIoULoss()
+        self.piou_loss = ProbIoULoss()
+
+    def _get_loss_class(self,
+                        logits,
+                        gt_class,
+                        match_indices,
+                        bg_index,
+                        num_gts,
+                        postfix="",
+                        iou_score=None):
+        # logits: [b, query, num_classes], gt_class: list[[n, 1]]
+        name_class = "loss_class" + postfix
+
+        target_label = paddle.full(logits.shape[:2], bg_index, dtype='int64')
+        bs, num_query_objects = target_label.shape
+        num_gt = sum(len(a) for a in gt_class)
+        if num_gt > 0:
+            index, updates = self._get_index_updates(num_query_objects,
+                                                     gt_class, match_indices)
+            target_label = paddle.scatter(
+                target_label.reshape([-1, 1]), index, updates.astype('int64'))
+            target_label = target_label.reshape([bs, num_query_objects])
+        if self.use_focal_loss:
+            target_label = F.one_hot(target_label,
+                                     self.num_classes + 1)[..., :-1]
+            if iou_score is not None and self.use_vfl:
+                target_score = paddle.zeros([bs, num_query_objects])
+                if num_gt > 0:
+                    target_score = paddle.scatter(
+                        target_score.reshape([-1, 1]), index, iou_score)
+                target_score = target_score.reshape(
+                    [bs, num_query_objects, 1]) * target_label
+                loss_ = self.loss_coeff['class'] * varifocal_loss_with_logits(
+                    logits, target_score, target_label,
+                    num_gts / num_query_objects)
+            else:
+                loss_ = self.loss_coeff['class'] * sigmoid_focal_loss(
+                    logits, target_label, num_gts / num_query_objects)
+        else:
+            loss_ = F.cross_entropy(
+                logits, target_label, weight=self.loss_coeff['class'])
+        return {name_class: loss_}
+
+    def _get_loss_bbox(self, boxes, angle_cls, gt_bbox, match_indices, num_gts, im_shape,
+                       postfix=""):
+        # boxes: [b, query, 4], gt_bbox: list[[n, 4]]
+        name_bbox = "loss_bbox" + postfix
+        name_giou = "loss_piou" + postfix
+        name_angle = "loss_angle" + postfix
+
+        loss = dict()
+        if sum(len(a) for a in gt_bbox) == 0:
+            loss[name_bbox] = paddle.to_tensor([0.])
+            loss[name_giou] = paddle.to_tensor([0.])
+            loss[name_angle] = paddle.to_tensor([0.])
+            return loss
+
+        src_bbox, src_angle_cls, target_bbox = self._get_src_target_assign_r(boxes, angle_cls, gt_bbox,
+                                                            match_indices)
+
+        target_bbox_normalize = target_bbox[:, :4] / im_shape
+        src_bbox_real = src_bbox[:, :4] * im_shape
+        src_bbox_real = paddle.concat([src_bbox_real, src_bbox[:, -1].unsqueeze(axis=1)], axis=-1)
+        loss[name_bbox] = self.loss_coeff['bbox'] * F.l1_loss(
+            src_bbox[:, :4], target_bbox_normalize, reduction='sum') / num_gts
+        loss[name_giou] = self.piou_loss(
+            src_bbox_real, target_bbox)
+        loss[name_giou] = loss[name_giou].sum() / num_gts
+        loss[name_giou] = self.loss_coeff['giou'] * loss[name_giou]
+
+        tgt_angle_pos = (
+                target_bbox[:, 4] /
+                self.half_pi_bin).clip(0, self.angle_max - 0.01)
+        loss[name_angle] = self._df_loss(src_angle_cls, tgt_angle_pos)
+        loss[name_angle] = loss[name_angle] * 0.05
+
+        return loss
+
+
+    @staticmethod
+    def _df_loss(pred_dist, target):
+        target_left = paddle.cast(target, 'int64')
+        target_right = target_left + 1
+        weight_left = target_right.astype('float32') - target
+        weight_right = 1 - weight_left
+        loss_left = F.cross_entropy(
+            pred_dist, target_left, reduction='none')
+        loss_left = loss_left * weight_left
+        loss_right = F.cross_entropy(
+            pred_dist, target_right, reduction='none') * weight_right
+        return (loss_left + loss_right).mean(-1, keepdim=True)
+    def _get_loss_mask(self, masks, gt_mask, match_indices, num_gts,
+                       postfix=""):
+        # masks: [b, query, h, w], gt_mask: list[[n, H, W]]
+        name_mask = "loss_mask" + postfix
+        name_dice = "loss_dice" + postfix
+
+        loss = dict()
+        if sum(len(a) for a in gt_mask) == 0:
+            loss[name_mask] = paddle.to_tensor([0.])
+            loss[name_dice] = paddle.to_tensor([0.])
+            return loss
+
+        src_masks, target_masks = self._get_src_target_assign(masks, gt_mask,
+                                                              match_indices)
+        src_masks = F.interpolate(
+            src_masks.unsqueeze(0),
+            size=target_masks.shape[-2:],
+            mode="bilinear")[0]
+        loss[name_mask] = self.loss_coeff['mask'] * F.sigmoid_focal_loss(
+            src_masks,
+            target_masks,
+            paddle.to_tensor(
+                [num_gts], dtype='float32'))
+        loss[name_dice] = self.loss_coeff['dice'] * self._dice_loss(
+            src_masks, target_masks, num_gts)
+        return loss
+
+    def _dice_loss(self, inputs, targets, num_gts):
+        inputs = F.sigmoid(inputs)
+        inputs = inputs.flatten(1)
+        targets = targets.flatten(1)
+        numerator = 2 * (inputs * targets).sum(1)
+        denominator = inputs.sum(-1) + targets.sum(-1)
+        loss = 1 - (numerator + 1) / (denominator + 1)
+        return loss.sum() / num_gts
+
+    def _get_loss_aux(self,
+                      boxes,
+                      logits,
+                      angle_cls,
+                      gt_bbox,
+                      gt_class,
+                      im_shape,
+                      bg_index,
+                      num_gts,
+                      dn_match_indices=None,
+                      postfix="",
+                      masks=None,
+                      gt_mask=None):
+        loss_class = []
+        loss_bbox, loss_giou = [], []
+        loss_mask, loss_dice = [], []
+        loss_angle = []
+        if dn_match_indices is not None:
+            match_indices = dn_match_indices
+        elif self.use_uni_match:
+            match_indices = self.matcher(
+                boxes[self.uni_match_ind],
+                logits[self.uni_match_ind],
+                gt_bbox,
+                gt_class,
+                masks=masks[self.uni_match_ind] if masks is not None else None,
+                gt_mask=gt_mask)
+        for i, (aux_boxes, aux_angle_cls, aux_logits) in enumerate(zip(boxes, angle_cls, logits)):
+            aux_masks = masks[i] if masks is not None else None
+            if not self.use_uni_match and dn_match_indices is None:
+                match_indices = self.matcher(
+                    aux_boxes,
+                    aux_logits,
+                    aux_angle_cls,
+                    gt_bbox,
+                    gt_class,
+                    im_shape,
+                    masks=aux_masks,
+                    gt_mask=gt_mask)
+            #im_shape_ = np.array(im_shape)
+            im_shape_ = paddle.tile(im_shape, [2])
+            if self.use_vfl:
+                if sum(len(a) for a in gt_bbox) > 0:
+                    src_bbox, target_bbox = self._get_src_target_assign(
+                        aux_boxes.detach(), gt_bbox, match_indices)
+                    src_bbox_real = src_bbox[:, :4] * im_shape_
+                    src_bbox_real = paddle.concat([src_bbox_real, src_bbox[:, -1].unsqueeze(axis=1)], axis=-1)
+                    iou_score = matched_rbox_iou(
+                        src_bbox_real,
+                        target_bbox).unsqueeze(1)
+
+                else:
+                    iou_score = None
+            else:
+                iou_score = None
+            loss_class.append(
+                self._get_loss_class(aux_logits, gt_class, match_indices,
+                                     bg_index, num_gts, postfix, iou_score)[
+                                         'loss_class' + postfix])
+            loss_ = self._get_loss_bbox(aux_boxes,aux_angle_cls, gt_bbox, match_indices,
+                                        num_gts,im_shape_, postfix)
+            loss_bbox.append(loss_['loss_bbox' + postfix])
+            loss_giou.append(loss_['loss_piou' + postfix])
+            loss_angle.append(loss_['loss_angle' + postfix])
+            if masks is not None and gt_mask is not None:
+                loss_ = self._get_loss_mask(aux_masks, gt_mask, match_indices,
+                                            num_gts, postfix)
+                loss_mask.append(loss_['loss_mask' + postfix])
+                loss_dice.append(loss_['loss_dice' + postfix])
+        loss = {
+            "loss_class_aux" + postfix: paddle.add_n(loss_class),
+            "loss_bbox_aux" + postfix: paddle.add_n(loss_bbox),
+            "loss_piou_aux" + postfix: paddle.add_n(loss_giou),
+            "loss_angle_aux" + postfix: paddle.add_n(loss_angle)
+        }
+        if masks is not None and gt_mask is not None:
+            loss["loss_mask_aux" + postfix] = paddle.add_n(loss_mask)
+            loss["loss_dice_aux" + postfix] = paddle.add_n(loss_dice)
+        return loss
+
+    def _get_index_updates(self, num_query_objects, target, match_indices):
+        batch_idx = paddle.concat([
+            paddle.full_like(src, i) for i, (src, _) in enumerate(match_indices)
+        ])
+        src_idx = paddle.concat([src for (src, _) in match_indices])
+        src_idx += (batch_idx * num_query_objects)
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, dst, axis=0) for t, (_, dst) in zip(target, match_indices)
+        ])
+        return src_idx, target_assign
+
+    def _get_src_target_assign_r(self, src, src_angle, target, match_indices):
+        src_assign = paddle.concat([
+            paddle.gather(
+                t, I, axis=0) if len(I) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (I, _) in zip(src, match_indices)
+        ])
+        src_assign_angle = paddle.concat([
+            paddle.gather(
+                t, I, axis=0) if len(I) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (I, _) in zip(src_angle, match_indices)
+        ])
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, J, axis=0) if len(J) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (_, J) in zip(target, match_indices)
+        ])
+        return src_assign, src_assign_angle, target_assign
+
+    def _get_src_target_assign(self, src, target, match_indices):
+        src_assign = paddle.concat([
+            paddle.gather(
+                t, I, axis=0) if len(I) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (I, _) in zip(src, match_indices)
+        ])
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, J, axis=0) if len(J) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (_, J) in zip(target, match_indices)
+        ])
+        return src_assign, target_assign
+
+    def _get_num_gts(self, targets, dtype="float32"):
+        num_gts = sum(len(a) for a in targets)
+        num_gts = paddle.to_tensor([num_gts], dtype=dtype)
+        if paddle.distributed.get_world_size() > 1:
+            paddle.distributed.all_reduce(num_gts)
+            num_gts /= paddle.distributed.get_world_size()
+        num_gts = paddle.clip(num_gts, min=1.)
+        return num_gts
+
+    def _get_prediction_loss(self,
+                             boxes,
+                             logits,
+                             angles_cls,
+                             gt_bbox,
+                             gt_class,
+                             im_shape,
+                             masks=None,
+                             gt_mask=None,
+                             postfix="",
+                             dn_match_indices=None,
+                             num_gts=1):
+        if dn_match_indices is None:
+            match_indices = self.matcher(
+                boxes, logits, angles_cls, gt_bbox, gt_class,im_shape, masks=masks, gt_mask=gt_mask)
+        else:
+            match_indices = dn_match_indices
+
+        #im_shape = np.array(im_shape)
+        im_shape = paddle.tile(im_shape, [2])
+
+        if self.use_vfl:
+            if sum(len(a) for a in gt_bbox) > 0:
+                src_bbox, target_bbox = self._get_src_target_assign(
+                    boxes.detach(), gt_bbox, match_indices)
+
+                src_bbox_real = src_bbox[:, :4] * im_shape
+                src_bbox_real = paddle.concat([src_bbox_real, src_bbox[:, -1].unsqueeze(axis=1)], axis=-1)
+
+                iou_score = matched_rbox_iou(
+                    src_bbox_real,
+                    target_bbox).unsqueeze(1)
+            else:
+                iou_score = None
+        else:
+            iou_score = None
+
+        loss = dict()
+        loss.update(
+            self._get_loss_class(logits, gt_class, match_indices,
+                                 self.num_classes, num_gts, postfix, iou_score))
+        loss.update(
+            self._get_loss_bbox(boxes, angles_cls, gt_bbox, match_indices, num_gts,im_shape,
+                                postfix))
+        if masks is not None and gt_mask is not None:
+            loss.update(
+                self._get_loss_mask(masks, gt_mask, match_indices, num_gts,
+                                    postfix))
+        return loss
+
+    def forward(self,
+                boxes,
+                logits,
+                angles_cls,
+                gt_bbox,
+                gt_class,
+                im_shape,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                **kwargs):
+        r"""
+        Args:
+            boxes (Tensor): [l, b, query, 4]
+            logits (Tensor): [l, b, query, num_classes]
+            gt_bbox (List(Tensor)): list[[n, 4]]
+            gt_class (List(Tensor)): list[[n, 1]]
+            masks (Tensor, optional): [l, b, query, h, w]
+            gt_mask (List(Tensor), optional): list[[n, H, W]]
+            postfix (str): postfix of loss name
+        """
+
+        dn_match_indices = kwargs.get("dn_match_indices", None)
+        num_gts = kwargs.get("num_gts", None)
+        if num_gts is None:
+            num_gts = self._get_num_gts(gt_class)
+
+        total_loss = self._get_prediction_loss(
+            boxes[-1],
+            logits[-1],
+            angles_cls[-1],
+            gt_bbox,
+            gt_class,
+            im_shape,
+            masks=masks[-1] if masks is not None else None,
+            gt_mask=gt_mask,
+            postfix=postfix,
+            dn_match_indices=dn_match_indices,
+            num_gts=num_gts)
+
+        if self.aux_loss:
+            total_loss.update(
+                self._get_loss_aux(
+                    boxes[:-1],
+                    logits[:-1],
+                    angles_cls[:-1],
+                    gt_bbox,
+                    gt_class,
+                    im_shape,
+                    self.num_classes,
+                    num_gts,
+                    dn_match_indices,
+                    postfix,
+                    masks=masks[:-1] if masks is not None else None,
+                    gt_mask=gt_mask))
+
+        return total_loss
+
+
+@register
+class DETRLoss_Rotate_Paired(nn.Layer):
+    __shared__ = ['num_classes', 'use_focal_loss']
+    __inject__ = ['matcher']
+
+    def __init__(self,
+                 num_classes=80,
+                 matcher='HungarianMatcher_Rotate_Paired',
+                 loss_coeff={
+                     'class': 1,
+                     'bbox': 5,
+                     'giou': 2,
+                     'no_object': 0.1,
+                     'mask': 1,
+                     'dice': 1
+                 },
+                 aux_loss=True,
+                 use_focal_loss=False,
+                 use_vfl=False,
+                 use_uni_match=False,
+                 group=False,
+                 groupx4=False,
+                 groupx5=False,
+                 groupx3_v3=False,
+                 groupx3_v4=False,
+                 groupx3_v5=False,
+                 groupx3_v6=False,
+                 uni_match_ind=0):
+        r"""
+        Args:
+            num_classes (int): The number of classes.
+            matcher (HungarianMatcher): It computes an assignment between the targets
+                and the predictions of the network.
+            loss_coeff (dict): The coefficient of loss.
+            aux_loss (bool): If 'aux_loss = True', loss at each decoder layer are to be used.
+            use_focal_loss (bool): Use focal loss or not.
+        """
+        super(DETRLoss_Rotate_Paired, self).__init__()
+
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.loss_coeff = loss_coeff
+        self.aux_loss = aux_loss
+        self.use_focal_loss = use_focal_loss
+        self.use_vfl = use_vfl
+        self.use_uni_match = use_uni_match
+        self.uni_match_ind = uni_match_ind
+        self.group = group
+        self.groupx4 = groupx4
+        self.groupx5 = groupx5
+        self.groupx3_v3 = groupx3_v3
+        self.groupx3_v4 = groupx3_v4
+        self.groupx3_v5 = groupx3_v5
+        self.groupx3_v6 = groupx3_v6
+        self.half_pi = paddle.to_tensor(
+            [1.5707963267948966], dtype=paddle.float32)
+        self.angle_max = 90
+        self.half_pi_bin = self.half_pi / self.angle_max
+
+        if not self.use_focal_loss:
+            self.loss_coeff['class'] = paddle.full([num_classes + 1],
+                                                   loss_coeff['class'])
+            self.loss_coeff['class'][-1] = loss_coeff['no_object']
+        #self.giou_loss = GIoULoss()
+        self.piou_loss = ProbIoULoss()
+
+    def _get_loss_class(self,
+                        logits,
+                        gt_class,
+                        match_indices,
+                        bg_index,
+                        num_gts,
+                        postfix="",
+                        iou_score_vis=None,
+                        iou_score_ir=None):
+        # logits: [b, query, num_classes], gt_class: list[[n, 1]]
+        name_class = "loss_class" + postfix
+
+        target_label = paddle.full(logits.shape[:2], bg_index, dtype='int64')
+        bs, num_query_objects = target_label.shape
+        num_gt = sum(len(a) for a in gt_class)
+        if num_gt > 0:
+            index, updates = self._get_index_updates(num_query_objects,
+                                                     gt_class, match_indices)
+            target_label = paddle.scatter(
+                target_label.reshape([-1, 1]), index, updates.astype('int64'))
+            target_label = target_label.reshape([bs, num_query_objects])
+        if self.use_focal_loss:
+            target_label = F.one_hot(target_label,
+                                     self.num_classes + 1)[..., :-1]
+            if iou_score_vis is not None and iou_score_ir is not None and self.use_vfl:
+                target_score_vis = paddle.zeros([bs, num_query_objects])
+                target_score_ir = paddle.zeros([bs, num_query_objects])
+                if num_gt > 0:
+                    target_score_vis = paddle.scatter(
+                        target_score_vis.reshape([-1, 1]), index, iou_score_vis)
+                    target_score_ir = paddle.scatter(
+                        target_score_ir.reshape([-1, 1]), index, iou_score_ir)
+                target_score_vis = target_score_vis.reshape(
+                    [bs, num_query_objects, 1]) * target_label
+                target_score_ir = target_score_ir.reshape(
+                    [bs, num_query_objects, 1]) * target_label
+                target_score = (target_score_vis + target_score_ir) / 2
+                loss_ = self.loss_coeff['class'] * varifocal_loss_with_logits(
+                    logits, target_score, target_label,
+                    num_gts / num_query_objects)
+            else:
+                loss_ = self.loss_coeff['class'] * sigmoid_focal_loss(
+                    logits, target_label, num_gts / num_query_objects)
+        else:
+            loss_ = F.cross_entropy(
+                logits, target_label, weight=self.loss_coeff['class'])
+        return {name_class: loss_}
+
+    def _get_loss_bbox(self, boxes_vis,boxes_ir, angle_cls_vis,angle_cls_ir, gt_bbox_vis,gt_bbox_ir, match_indices, num_gts, im_shape,
+                       postfix=""):
+        def is_all_empty(match_indices):
+            for pair in match_indices:
+                for tensor in pair:
+                    if tensor.shape != [0]:
+                        return False
+            return True
+        # boxes: [b, query, 4], gt_bbox: list[[n, 4]]
+        name_bbox_vis = "loss_bbox_vis" + postfix
+        name_giou_vis = "loss_piou_vis" + postfix
+        name_angle_vis = "loss_angle_vis" + postfix
+        name_bbox_ir = "loss_bbox_ir" + postfix
+        name_giou_ir = "loss_piou_ir" + postfix
+        name_angle_ir = "loss_angle_ir" + postfix
+        name_both_modality_pred_similar= "loss_both_modality_pred_similar" + postfix
+        loss = dict()
+        if sum(len(a) for a in gt_bbox_vis) == 0:
+            loss[name_bbox_vis] = paddle.to_tensor([0.])
+            loss[name_giou_vis] = paddle.to_tensor([0.])
+            loss[name_angle_vis] = paddle.to_tensor([0.])
+            loss[name_bbox_ir] = paddle.to_tensor([0.])
+            loss[name_giou_ir] = paddle.to_tensor([0.])
+            loss[name_angle_ir] = paddle.to_tensor([0.])
+            return loss
+        bbox_vis_match_loss=paddle.to_tensor([0.])
+        giou_vis_match_loss=paddle.to_tensor([0.])
+        angle_vis_match_loss=paddle.to_tensor([0.])
+        bbox_vis_unmatch_loss=paddle.to_tensor([0.])
+        giou_vis_unmatch_loss=paddle.to_tensor([0.])
+        angle_vis_unmatch_loss=paddle.to_tensor([0.])
+        irpredbbox_loss_vispredbbox=paddle.to_tensor([0.],dtype=paddle.float32, stop_gradient=False)
+        vispred_numatch_bbox_loss_irgtbbox_unmatch=paddle.to_tensor([0.],dtype=paddle.float32, stop_gradient=False)
+
+        if self.paired_gt_rbox_match_shape != None:
+            #irpredbbox_loss_vispredbbox=self.margin_Huberloss(boxes_ir,boxes_vis,angle_cls_ir,angle_cls_vis)
+            sorted_match_indices = []
+            for (idx_tensor, value_tensor) in match_indices:
+                # 获取排序后的索引（按值从小到大排序）
+                sorted_indices = paddle.argsort(value_tensor)
+                # 根据排序后的索引重新排列索引张量和值张量
+                sorted_idx_tensor = paddle.gather(idx_tensor, sorted_indices)
+                sorted_value_tensor = paddle.gather(value_tensor, sorted_indices)
+                sorted_match_indices.append((sorted_idx_tensor, sorted_value_tensor))
+            sorted_match_indices_match = []
+            for i, (idx_tensor, value_tensor) in enumerate(sorted_match_indices):
+                n = self.paired_gt_rbox_match_shape[i]  # 取前 n 个值
+                if n > len(idx_tensor):  # 如果 n 大于张量的长度，取全部
+                    n = len(idx_tensor)
+                sorted_match_indices_match.append((idx_tensor[:n], value_tensor[:n]))
+            
+            if not is_all_empty(sorted_match_indices_match):
+                src_bbox_vis, src_angle_cls_vis, target_bbox_vis = self._get_src_target_assign_r(boxes_vis, angle_cls_vis, gt_bbox_vis,
+                                                                    sorted_match_indices_match)
+                src_bbox_ir, src_angle_cls_ir, target_bbox_ir = self._get_src_target_assign_r(boxes_ir, angle_cls_ir, gt_bbox_ir,
+                                                                    sorted_match_indices_match)                
+                target_bbox_normalize_vis = target_bbox_vis[:, :4] / im_shape
+                target_bbox_normalize_ir = target_bbox_ir[:, :4] / im_shape
+                src_bbox_real_vis = src_bbox_vis[:, :4] * im_shape
+                src_bbox_real_vis = paddle.concat([src_bbox_real_vis, src_bbox_vis[:, -1].unsqueeze(axis=1)], axis=-1)
+                bbox_vis_match_loss= self.loss_coeff['bbox'] * F.l1_loss(
+                    src_bbox_vis[:, :4], target_bbox_normalize_vis, reduction='sum') / num_gts
+                giou_vis_match_loss = self.piou_loss(
+                    src_bbox_real_vis, target_bbox_vis)
+                giou_vis_match_loss = giou_vis_match_loss.sum() / num_gts
+                giou_vis_match_loss= self.loss_coeff['giou'] * giou_vis_match_loss
+                tgt_angle_pos_vis = (
+                        target_bbox_vis[:, 4] /
+                        self.half_pi_bin).clip(0, self.angle_max - 0.01)
+                tgt_angle_pos_ir = (
+                        target_bbox_ir[:, 4] /
+                        self.half_pi_bin).clip(0, self.angle_max - 0.01)                
+                angle_vis_match_loss = self._df_loss(src_angle_cls_vis, tgt_angle_pos_vis)
+                angle_vis_match_loss = angle_vis_match_loss * 0.05
+                
+
+            sorted_match_indices_unmatch = []
+            for i, (idx_tensor, value_tensor) in enumerate(sorted_match_indices):
+                n = self.paired_gt_rbox_match_shape[i]  # 取前 n 个值
+                if n > len(idx_tensor):  # 如果 n 大于张量的长度，取全部
+                    n = len(idx_tensor)
+                sorted_match_indices_unmatch.append((idx_tensor[n:], value_tensor[n:]))
+            if not is_all_empty(sorted_match_indices_unmatch):
+                src_bbox_vis, src_angle_cls_vis, target_bbox_vis = self._get_src_target_assign_r(boxes_vis, angle_cls_vis, gt_bbox_vis,
+                                                                    sorted_match_indices_unmatch)
+                src_bbox_ir, src_angle_cls_ir, target_bbox_ir = self._get_src_target_assign_r(boxes_ir, angle_cls_ir, gt_bbox_ir,
+                                                                    sorted_match_indices_unmatch) 
+                target_bbox_normalize_vis = target_bbox_vis[:, :4] / im_shape
+                target_bbox_normalize_ir = target_bbox_ir[:, :4] / im_shape
+                src_bbox_real_vis = src_bbox_vis[:, :4] * im_shape
+                src_bbox_real_vis = paddle.concat([src_bbox_real_vis, src_bbox_vis[:, -1].unsqueeze(axis=1)], axis=-1)
+                bbox_vis_unmatch_loss= self.loss_coeff['bbox'] * F.l1_loss(
+                    src_bbox_vis[:, :4], target_bbox_normalize_vis, reduction='sum') / num_gts
+                giou_vis_unmatch_loss = self.piou_loss(
+                    src_bbox_real_vis, target_bbox_vis)
+                giou_vis_unmatch_loss = giou_vis_unmatch_loss.sum() / num_gts
+                giou_vis_unmatch_loss= self.loss_coeff['giou'] * giou_vis_unmatch_loss
+
+                tgt_angle_pos_vis = (
+                        target_bbox_vis[:, 4] /
+                        self.half_pi_bin).clip(0, self.angle_max - 0.01)
+                tgt_angle_pos_ir = (
+                        target_bbox_ir[:, 4] /
+                        self.half_pi_bin).clip(0, self.angle_max - 0.01)  
+                angle_vis_unmatch_loss = self._df_loss(src_angle_cls_vis, tgt_angle_pos_vis)
+                angle_vis_unmatch_loss = angle_vis_unmatch_loss * 0.05
+                #vispred_numatch_bbox_loss_irgtbbox_unmatch=self.margin_Huberloss(src_bbox_vis,target_bbox_normalize_ir,None,None)+self._df_loss(src_angle_cls_vis, tgt_angle_pos_ir)
+
+            # loss[name_bbox_vis] = 0.5 * bbox_vis_match_loss + 0.5 * bbox_vis_unmatch_loss
+            # loss[name_giou_vis] =  0.5 * giou_vis_match_loss +  0.5 * giou_vis_unmatch_loss
+            # loss[name_angle_vis] =  0.5 * angle_vis_match_loss +  0.5 * angle_vis_unmatch_loss
+            loss[name_bbox_vis] = bbox_vis_match_loss
+            loss[name_giou_vis] =  giou_vis_match_loss
+            loss[name_angle_vis] =  angle_vis_match_loss
+            src_bbox_ir, src_angle_cls_ir, target_bbox_ir = self._get_src_target_assign_r(boxes_ir, angle_cls_ir,
+                                                                                            gt_bbox_ir,
+                                                                                            match_indices)
+            target_bbox_normalize_ir = target_bbox_ir[:, :4] / im_shape
+            src_bbox_real_ir = src_bbox_ir[:, :4] * im_shape
+            src_bbox_real_ir = paddle.concat([src_bbox_real_ir, src_bbox_ir[:, -1].unsqueeze(axis=1)], axis=-1)
+            loss[name_bbox_ir] = self.loss_coeff['bbox'] * F.l1_loss(
+                src_bbox_ir[:, :4], target_bbox_normalize_ir, reduction='sum') / num_gts
+            loss[name_giou_ir] = self.piou_loss(
+                src_bbox_real_ir, target_bbox_ir)
+            loss[name_giou_ir] = loss[name_giou_ir].sum() / num_gts
+            loss[name_giou_ir] = self.loss_coeff['giou'] * loss[name_giou_ir]
+
+            tgt_angle_pos_ir = (
+                    target_bbox_ir[:, 4] /
+                    self.half_pi_bin).clip(0, self.angle_max - 0.01)
+            loss[name_angle_ir] = self._df_loss(src_angle_cls_ir, tgt_angle_pos_ir)
+            loss[name_angle_ir] = loss[name_angle_ir] * 0.05
+
+            #loss[name_both_modality_pred_similar] =  irpredbbox_loss_vispredbbox + vispred_numatch_bbox_loss_irgtbbox_unmatch
+
+        else:
+            src_bbox_vis, src_angle_cls_vis, target_bbox_vis = self._get_src_target_assign_r(boxes_vis, angle_cls_vis, gt_bbox_vis,
+                                                                match_indices)
+            target_bbox_normalize_vis = target_bbox_vis[:, :4] / im_shape
+            src_bbox_real_vis = src_bbox_vis[:, :4] * im_shape
+            src_bbox_real_vis = paddle.concat([src_bbox_real_vis, src_bbox_vis[:, -1].unsqueeze(axis=1)], axis=-1)
+            loss[name_bbox_vis] = self.loss_coeff['bbox'] * F.l1_loss(
+                src_bbox_vis[:, :4], target_bbox_normalize_vis, reduction='sum') / num_gts
+            loss[name_giou_vis] = self.piou_loss(
+                src_bbox_real_vis, target_bbox_vis)
+            loss[name_giou_vis] = loss[name_giou_vis].sum() / num_gts
+            loss[name_giou_vis] = self.loss_coeff['giou'] * loss[name_giou_vis]
+
+            tgt_angle_pos_vis = (
+                    target_bbox_vis[:, 4] /
+                    self.half_pi_bin).clip(0, self.angle_max - 0.01)
+            loss[name_angle_vis] = self._df_loss(src_angle_cls_vis, tgt_angle_pos_vis)
+            loss[name_angle_vis] = loss[name_angle_vis] * 0.05
+
+            src_bbox_ir, src_angle_cls_ir, target_bbox_ir = self._get_src_target_assign_r(boxes_ir, angle_cls_ir,
+                                                                                            gt_bbox_ir,
+                                                                                            match_indices)
+
+            target_bbox_normalize_ir = target_bbox_ir[:, :4] / im_shape
+            src_bbox_real_ir = src_bbox_ir[:, :4] * im_shape
+            src_bbox_real_ir = paddle.concat([src_bbox_real_ir, src_bbox_ir[:, -1].unsqueeze(axis=1)], axis=-1)
+            loss[name_bbox_ir] = self.loss_coeff['bbox'] * F.l1_loss(
+                src_bbox_ir[:, :4], target_bbox_normalize_ir, reduction='sum') / num_gts
+            loss[name_giou_ir] = self.piou_loss(
+                src_bbox_real_ir, target_bbox_ir)
+            loss[name_giou_ir] = loss[name_giou_ir].sum() / num_gts
+            loss[name_giou_ir] = self.loss_coeff['giou'] * loss[name_giou_ir]
+
+            tgt_angle_pos_ir = (
+                    target_bbox_ir[:, 4] /
+                    self.half_pi_bin).clip(0, self.angle_max - 0.01)
+            loss[name_angle_ir] = self._df_loss(src_angle_cls_ir, tgt_angle_pos_ir)
+            loss[name_angle_ir] = loss[name_angle_ir] * 0.05
+
+        return loss
+
+    @staticmethod
+    def _df_loss(pred_dist, target):
+        target_left = paddle.cast(target, 'int64')
+        target_right = target_left + 1
+        weight_left = target_right.astype('float32') - target
+        weight_right = 1 - weight_left
+        loss_left = F.cross_entropy(
+            pred_dist, target_left, reduction='none')
+        loss_left = loss_left * weight_left
+        loss_right = F.cross_entropy(
+            pred_dist, target_right, reduction='none') * weight_right
+        return (loss_left + loss_right).mean(-1, keepdim=True)
+    def _get_loss_mask(self, masks, gt_mask, match_indices, num_gts,
+                       postfix=""):
+        # masks: [b, query, h, w], gt_mask: list[[n, H, W]]
+        name_mask = "loss_mask" + postfix
+        name_dice = "loss_dice" + postfix
+
+        loss = dict()
+        if sum(len(a) for a in gt_mask) == 0:
+            loss[name_mask] = paddle.to_tensor([0.])
+            loss[name_dice] = paddle.to_tensor([0.])
+            return loss
+
+        src_masks, target_masks = self._get_src_target_assign(masks, gt_mask,
+                                                              match_indices)
+        src_masks = F.interpolate(
+            src_masks.unsqueeze(0),
+            size=target_masks.shape[-2:],
+            mode="bilinear")[0]
+        loss[name_mask] = self.loss_coeff['mask'] * F.sigmoid_focal_loss(
+            src_masks,
+            target_masks,
+            paddle.to_tensor(
+                [num_gts], dtype='float32'))
+        loss[name_dice] = self.loss_coeff['dice'] * self._dice_loss(
+            src_masks, target_masks, num_gts)
+        return loss
+
+    def _dice_loss(self, inputs, targets, num_gts):
+        inputs = F.sigmoid(inputs)
+        inputs = inputs.flatten(1)
+        targets = targets.flatten(1)
+        numerator = 2 * (inputs * targets).sum(1)
+        denominator = inputs.sum(-1) + targets.sum(-1)
+        loss = 1 - (numerator + 1) / (denominator + 1)
+        return loss.sum() / num_gts
+    
+        
+    def margin_Huberloss(self, boxes_ir, boxes_vis, angle_cls_ir, angle_cls_vis, pixel_margin=30, a=1, b=1, c=1):
+        """
+        直接在归一化坐标空间计算偏移损失
+        参数:
+            boxes_ir:  [B, N, 5] (x_center_norm, y_center_norm, w_norm, h_norm, ...)
+            boxes_vis: [B, N, 5]
+        """
+        x_margin = paddle.to_tensor(pixel_margin / 840)
+        y_margin = paddle.to_tensor(pixel_margin / 712)
+        margin = paddle.sqrt(x_margin**2 + y_margin**2)
+
+        # 提取归一化中心坐标
+        centers_ir = boxes_ir[..., :2]   # [B, N, 2]
+        centers_vis = boxes_vis[..., :2] # [B, N, 2]
+
+        # 计算归一化空间偏移量
+        delta = centers_ir - centers_vis # [B, N, 2]
+        # 计算归一化欧氏距离
+        distance = paddle.norm(delta, axis=-1) #paddle.sqrt(paddle.sum(paddle.square(delta), axis=-1)) 
+    
+        # # 使用 ReLU 替代条件判断
+        loss = 3 * paddle.square(paddle.nn.functional.relu(distance - margin))  # 直接计算平方项
+        position_loss = loss.mean().unsqueeze(0)
+
+        w_ir = boxes_ir[...,2]
+        h_ir = boxes_ir[...,3]
+        w_vis = boxes_vis[...,2]
+        h_vis = boxes_vis[...,3]
+        shape_loss = (paddle.abs(w_ir - w_vis) + 
+                     paddle.abs(h_ir - h_vis)+
+                     paddle.abs(paddle.log(w_ir/h_ir) - paddle.log(w_vis/h_vis))).mean().unsqueeze(0)    #
+        # 角度分布对齐损失（双向KL散度）
+        if angle_cls_ir is None and angle_cls_vis is None:
+            angle_loss = paddle.to_tensor([0.])
+        else:
+            prob_ir = F.softmax(angle_cls_ir, axis=-1)
+            prob_vis = F.softmax(angle_cls_vis, axis=-1)
+            epsilon=1e-10
+            p = paddle.clip(prob_vis, min=epsilon)
+            q = paddle.clip(prob_ir, min=epsilon)
+            log_p = paddle.log(p)
+            log_q = paddle.log(q)
+            kl_loss=F.kl_div(log_p, q, reduction='mean') + F.kl_div(log_q, p, reduction='mean')            
+            # 注意力权重增强（基于最大类别置信度）
+            weights = 1 + F.sigmoid(paddle.maximum(prob_ir, prob_vis))
+            angle_loss = kl_loss * weights.mean().unsqueeze(0)
+
+        return a*position_loss + b*shape_loss + c*angle_loss
+
+ 
+    def _get_loss_aux(self,
+                      boxes_vis,
+                      boxes_ir,
+                      logits,
+                      angle_cls_vis,
+                      angle_cls_ir,
+                      gt_bbox_vis,
+                      gt_bbox_ir,
+                      gt_class,
+                      im_shape,
+                      bg_index,
+                      num_gts,
+                      dn_match_indices=None,
+                      postfix="",
+                      masks=None,
+                      gt_mask=None):
+        loss_class = []
+        loss_bbox_vis, loss_giou_vis = [], []
+        loss_bbox_ir, loss_giou_ir = [], []
+        loss_mask, loss_dice = [], []
+        loss_angle_vis = []
+        loss_angle_ir = []
+        if dn_match_indices is not None:
+            match_indices = dn_match_indices
+        elif self.use_uni_match:
+            match_indices = self.matcher(
+                boxes_vis[self.uni_match_ind],
+                boxes_ir[self.uni_match_ind],
+                logits[self.uni_match_ind],
+                gt_bbox_vis,
+                gt_bbox_ir,
+                gt_class,
+                masks=masks[self.uni_match_ind] if masks is not None else None,
+                gt_mask=gt_mask)
+        for i, (aux_boxes_vis,aux_boxes_ir, aux_angle_cls_vis,aux_angle_cls_ir, aux_logits) in enumerate(zip(boxes_vis,boxes_ir, angle_cls_vis,angle_cls_ir, logits)):
+            aux_masks = masks[i] if masks is not None else None
+            if not self.use_uni_match and dn_match_indices is None:
+                match_indices = self.matcher(
+                    aux_boxes_vis,
+                    aux_boxes_ir,
+                    aux_logits,
+                    aux_angle_cls_vis,
+                    aux_angle_cls_ir,
+                    gt_bbox_vis,
+                    gt_bbox_ir,
+                    gt_class,
+                    im_shape,
+                    masks=aux_masks,
+                    gt_mask=gt_mask)
+            #im_shape_ = np.array(im_shape)
+            im_shape_ = paddle.tile(im_shape, [2])
+            if self.use_vfl:
+                if sum(len(a) for a in gt_bbox_vis) > 0:
+                    src_bbox_vis, target_bbox_vis = self._get_src_target_assign(
+                        aux_boxes_vis.detach(), gt_bbox_vis, match_indices)
+                    src_bbox_real_vis = src_bbox_vis[:, :4] * im_shape_
+                    src_bbox_real_vis = paddle.concat([src_bbox_real_vis, src_bbox_vis[:, -1].unsqueeze(axis=1)], axis=-1)
+                    iou_score_vis = matched_rbox_iou(
+                        src_bbox_real_vis,
+                        target_bbox_vis).unsqueeze(1)
+
+                    src_bbox_ir, target_bbox_ir = self._get_src_target_assign(
+                        aux_boxes_ir.detach(), gt_bbox_ir, match_indices)
+                    src_bbox_real_ir = src_bbox_ir[:, :4] * im_shape_
+                    src_bbox_real_ir = paddle.concat([src_bbox_real_ir, src_bbox_ir[:, -1].unsqueeze(axis=1)], axis=-1)
+                    iou_score_ir = matched_rbox_iou(
+                        src_bbox_real_ir,
+                        target_bbox_ir).unsqueeze(1)
+
+                else:
+                    iou_score_vis = None
+                    iou_score_ir = None
+            else:
+                iou_score_vis = None
+                iou_score_ir = None
+            loss_class.append(
+                self._get_loss_class(aux_logits, gt_class, match_indices,
+                                     bg_index, num_gts, postfix, iou_score_vis,iou_score_ir)[
+                                         'loss_class' + postfix])
+            loss_ = self._get_loss_bbox(aux_boxes_vis,aux_boxes_ir,aux_angle_cls_vis,aux_angle_cls_ir, gt_bbox_vis,gt_bbox_ir, match_indices,
+                                        num_gts,im_shape_, postfix)
+            loss_bbox_vis.append(loss_['loss_bbox_vis' + postfix])
+            loss_giou_vis.append(loss_['loss_piou_vis' + postfix])
+            loss_angle_vis.append(loss_['loss_angle_vis' + postfix])
+            loss_bbox_ir.append(loss_['loss_bbox_ir' + postfix])
+            loss_giou_ir.append(loss_['loss_piou_ir' + postfix])
+            loss_angle_ir.append(loss_['loss_angle_ir' + postfix])
+            if masks is not None and gt_mask is not None:
+                loss_ = self._get_loss_mask(aux_masks, gt_mask, match_indices,
+                                            num_gts, postfix)
+                loss_mask.append(loss_['loss_mask' + postfix])
+                loss_dice.append(loss_['loss_dice' + postfix])
+        loss = {
+            "loss_class_aux" + postfix: paddle.add_n(loss_class),
+            "loss_bbox_aux_vis" + postfix: paddle.add_n(loss_bbox_vis),
+            "loss_piou_aux_vis" + postfix: paddle.add_n(loss_giou_vis),
+            "loss_angle_aux_vis" + postfix: paddle.add_n(loss_angle_vis),
+            "loss_bbox_aux_ir" + postfix: paddle.add_n(loss_bbox_ir),
+            "loss_piou_aux_ir" + postfix: paddle.add_n(loss_giou_ir),
+            "loss_angle_aux_ir" + postfix: paddle.add_n(loss_angle_ir),
+        }
+        if masks is not None and gt_mask is not None:
+            loss["loss_mask_aux" + postfix] = paddle.add_n(loss_mask)
+            loss["loss_dice_aux" + postfix] = paddle.add_n(loss_dice)
+        return loss
+
+    def _get_index_updates(self, num_query_objects, target, match_indices):
+        batch_idx = paddle.concat([
+            paddle.full_like(src, i) for i, (src, _) in enumerate(match_indices)
+        ])
+        src_idx = paddle.concat([src for (src, _) in match_indices])
+        src_idx += (batch_idx * num_query_objects)
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, dst, axis=0) for t, (_, dst) in zip(target, match_indices)
+        ])
+        return src_idx, target_assign
+
+    def _get_src_target_assign_r(self, src, src_angle, target, match_indices):
+
+        src_assign = paddle.concat([
+            paddle.gather(
+                t, I, axis=0) if len(I) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (I, _) in zip(src, match_indices)
+        ])
+        src_assign_angle = paddle.concat([
+            paddle.gather(
+                t, I, axis=0) if len(I) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (I, _) in zip(src_angle, match_indices)
+        ])
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, J, axis=0) if len(J) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (_, J) in zip(target, match_indices)
+        ])
+        return src_assign, src_assign_angle, target_assign
+
+    def _get_src_target_assign(self, src, target, match_indices):
+        src_assign = paddle.concat([
+            paddle.gather(
+                t, I, axis=0) if len(I) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (I, _) in zip(src, match_indices)
+        ])
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, J, axis=0) if len(J) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (_, J) in zip(target, match_indices)
+        ])
+        return src_assign, target_assign
+
+    def _get_num_gts(self, targets, dtype="float32"):
+        num_gts = sum(len(a) for a in targets)
+        num_gts = paddle.to_tensor([num_gts], dtype=dtype)
+        if paddle.distributed.get_world_size() > 1:
+            paddle.distributed.all_reduce(num_gts)
+            num_gts /= paddle.distributed.get_world_size()
+        num_gts = paddle.clip(num_gts, min=1.)
+        return num_gts
+
+    def _get_prediction_loss(self,
+                             boxes_vis,
+                             boxes_ir,
+                             logits,
+                             angles_cls_vis,
+                             angles_cls_ir,
+                             gt_bbox_vis,
+                             gt_bbox_ir,
+                             gt_class,
+                             im_shape,
+                             masks=None,
+                             gt_mask=None,
+                             postfix="",
+                             dn_match_indices=None,
+                             num_gts=1
+                            ):
+
+        if dn_match_indices is None:
+            match_indices = self.matcher(
+                boxes_vis,boxes_ir, logits, angles_cls_vis,angles_cls_ir, gt_bbox_vis,gt_bbox_ir, gt_class,im_shape, masks=masks, gt_mask=gt_mask)
+        else:
+            match_indices = dn_match_indices
+
+        #im_shape = np.array(im_shape)
+        im_shape = paddle.tile(im_shape, [2])
+
+
+
+        if self.use_vfl:
+            if sum(len(a) for a in gt_bbox_vis) > 0:
+                src_bbox_vis, target_bbox_vis = self._get_src_target_assign(
+                    boxes_vis.detach(), gt_bbox_vis, match_indices)
+                src_bbox_real_vis = src_bbox_vis[:, :4] * im_shape
+                src_bbox_real_vis = paddle.concat([src_bbox_real_vis, src_bbox_vis[:, -1].unsqueeze(axis=1)], axis=-1)
+                iou_score_vis = matched_rbox_iou(
+                    src_bbox_real_vis,
+                    target_bbox_vis).unsqueeze(1)
+
+                src_bbox_ir, target_bbox_ir = self._get_src_target_assign(
+                    boxes_ir.detach(), gt_bbox_ir, match_indices)
+                src_bbox_real_ir = src_bbox_ir[:, :4] * im_shape
+                src_bbox_real_ir = paddle.concat([src_bbox_real_ir, src_bbox_ir[:, -1].unsqueeze(axis=1)], axis=-1)
+                iou_score_ir = matched_rbox_iou(
+                    src_bbox_real_ir,
+                    target_bbox_ir).unsqueeze(1)
+            else:
+                iou_score_vis = None
+                iou_score_ir = None
+        else:
+            iou_score_vis = None
+            iou_score_ir = None
+
+        loss = dict()
+        loss.update(
+            self._get_loss_class(logits, gt_class, match_indices,
+                                 self.num_classes, num_gts, postfix, iou_score_vis, iou_score_ir))
+        loss.update(
+            self._get_loss_bbox(boxes_vis,boxes_ir, angles_cls_vis,angles_cls_ir, gt_bbox_vis,gt_bbox_ir, match_indices, num_gts,im_shape,
+                                postfix))
+        if masks is not None and gt_mask is not None:
+            loss.update(
+                self._get_loss_mask(masks, gt_mask, match_indices, num_gts,
+                                    postfix))
+        return loss
+
+    def forward(self,
+                boxes_vis,
+                boxes_ir,
+                logits,
+                angles_cls_vis,
+                angles_cls_ir,
+                gt_bbox_vis,
+                gt_bbox_ir,
+                gt_class,
+                im_shape,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                paired_gt_rbox_match_shape=None,
+                paired_gt_rbox_unmatch_shape=None,
+                **kwargs):
+        r"""
+        Args:
+            boxes (Tensor): [l, b, query, 4]
+            logits (Tensor): [l, b, query, num_classes]
+            gt_bbox (List(Tensor)): list[[n, 4]]
+            gt_class (List(Tensor)): list[[n, 1]]
+            masks (Tensor, optional): [l, b, query, h, w]
+            gt_mask (List(Tensor), optional): list[[n, H, W]]
+            postfix (str): postfix of loss name
+        """
+
+        dn_match_indices = kwargs.get("dn_match_indices", None)
+        num_gts = kwargs.get("num_gts", None)
+        if num_gts is None:
+            num_gts = self._get_num_gts(gt_class)
+
+        total_loss = self._get_prediction_loss(
+            boxes_vis[-1],
+            boxes_ir[-1],
+            logits[-1],
+            angles_cls_vis[-1],
+            angles_cls_ir[-1],
+            gt_bbox_vis,
+            gt_bbox_ir,
+            gt_class,
+            im_shape,
+            masks=masks[-1] if masks is not None else None,
+            gt_mask=gt_mask,
+            postfix=postfix,
+            dn_match_indices=dn_match_indices,
+            num_gts=num_gts)
+
+        if self.aux_loss:
+            total_loss.update(
+                self._get_loss_aux(
+                    boxes_vis[:-1],
+                    boxes_ir[:-1],
+                    logits[:-1],
+                    angles_cls_vis[:-1],
+                    angles_cls_ir[:-1],
+                    gt_bbox_vis,
+                    gt_bbox_ir,
+                    gt_class,
+                    im_shape,
+                    self.num_classes,
+                    num_gts,
+                    dn_match_indices,
+                    postfix,
+                    masks=masks[:-1] if masks is not None else None,
+                    gt_mask=gt_mask))
+
+        return total_loss
+
+
+@register
+class DETRLoss_Paired(nn.Layer):
+    __shared__ = ['num_classes', 'use_focal_loss']
+    __inject__ = ['matcher']
+
+    def __init__(self,
+                 num_classes=80,
+                 matcher='HungarianMatcher',
+                 loss_coeff={
+                     'class': 1,
+                     'bbox': 5,
+                     'giou': 2,
+                     'no_object': 0.1,
+                     'mask': 1,
+                     'dice': 1
+                 },
+                 aux_loss=True,
+                 use_focal_loss=False,
+                 use_vfl=False,
+                 use_uni_match=False,
+                 group=False,
+                 groupx4=False,
+                 groupx5=False,
+                 groupx3_v3=False,
+                 groupx3_v4=False,
+                 groupx3_v5=False,
+                 groupx3_v6=False,
+                 uni_match_ind=0):
+        r"""
+        Args:
+            num_classes (int): The number of classes.
+            matcher (HungarianMatcher): It computes an assignment between the targets
+                and the predictions of the network.
+            loss_coeff (dict): The coefficient of loss.
+            aux_loss (bool): If 'aux_loss = True', loss at each decoder layer are to be used.
+            use_focal_loss (bool): Use focal loss or not.
+        """
+        super(DETRLoss_Paired, self).__init__()
+
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.loss_coeff = loss_coeff
+        self.aux_loss = aux_loss
+        self.use_focal_loss = use_focal_loss
+        self.use_vfl = use_vfl
+        self.use_uni_match = use_uni_match
+        self.uni_match_ind = uni_match_ind
+        self.group = group
+        self.groupx4 = groupx4
+        self.groupx5 = groupx5
+        self.groupx3_v3 = groupx3_v3
+        self.groupx3_v4 = groupx3_v4
+        self.groupx3_v5 = groupx3_v5
+        self.groupx3_v6 = groupx3_v6
+
+        if not self.use_focal_loss:
+            self.loss_coeff['class'] = paddle.full([num_classes + 1],
+                                                   loss_coeff['class'])
+            self.loss_coeff['class'][-1] = loss_coeff['no_object']
+        self.giou_loss = GIoULoss()
+
+    def _get_loss_class(self,
+                        logits,
+                        gt_class,
+                        match_indices,
+                        bg_index,
+                        num_gts,
+                        postfix="",
+                        iou_score_vis=None,
+                        iou_score_ir=None):
+        # logits: [b, query, num_classes], gt_class: list[[n, 1]]
+        name_class = "loss_class" + postfix
+
+        target_label = paddle.full(logits.shape[:2], bg_index, dtype='int64')
+        bs, num_query_objects = target_label.shape
+        num_gt = sum(len(a) for a in gt_class)
+        if num_gt > 0:
+            index, updates = self._get_index_updates(num_query_objects,
+                                                     gt_class, match_indices)
+            target_label = paddle.scatter(
+                target_label.reshape([-1, 1]), index, updates.astype('int64'))
+            target_label = target_label.reshape([bs, num_query_objects])
+        if self.use_focal_loss:
+            target_label = F.one_hot(target_label,
+                                     self.num_classes + 1)[..., :-1]
+            if iou_score_vis is not None and iou_score_ir is not None and self.use_vfl:
+                target_score_vis = paddle.zeros([bs, num_query_objects])
+                target_score_ir = paddle.zeros([bs, num_query_objects])
+                if num_gt > 0:
+                    target_score_vis = paddle.scatter(
+                        target_score_vis.reshape([-1, 1]), index, iou_score_vis)
+                    target_score_ir = paddle.scatter(
+                        target_score_ir.reshape([-1, 1]), index, iou_score_ir)
+                target_score_vis = target_score_vis.reshape(
+                    [bs, num_query_objects, 1]) * target_label
+                target_score_ir = target_score_ir.reshape(
+                    [bs, num_query_objects, 1]) * target_label
+                target_score = (target_score_vis + target_score_ir) / 2
+                loss_ = self.loss_coeff['class'] * varifocal_loss_with_logits(
+                    logits, target_score, target_label,
+                    num_gts / num_query_objects)
+            else:
+                loss_ = self.loss_coeff['class'] * sigmoid_focal_loss(
+                    logits, target_label, num_gts / num_query_objects)
+        else:
+            loss_ = F.cross_entropy(
+                logits, target_label, weight=self.loss_coeff['class'])
+        return {name_class: loss_}
+
+    def _get_loss_bbox(self, boxes_vis, boxes_ir, gt_bbox_vis, gt_bbox_ir, match_indices, num_gts,
+                       postfix=""):
+        # boxes: [b, query, 4], gt_bbox: list[[n, 4]]
+        name_bbox_vis = "loss_bbox_vis" + postfix
+        name_giou_vis = "loss_giou_vis" + postfix
+        name_bbox_ir = "loss_bbox_ir" + postfix
+        name_giou_ir = "loss_giou_ir" + postfix
+
+        loss = dict()
+        if sum(len(a) for a in gt_bbox_vis) == 0:
+            loss[name_bbox_vis] = paddle.to_tensor([0.])
+            loss[name_giou_vis] = paddle.to_tensor([0.])
+            loss[name_bbox_ir] = paddle.to_tensor([0.])
+            loss[name_giou_ir] = paddle.to_tensor([0.])
+            return loss
+
+        src_bbox_vis, target_bbox_vis = self._get_src_target_assign(boxes_vis, gt_bbox_vis,
+                                                            match_indices)
+        loss[name_bbox_vis] = self.loss_coeff['bbox'] * F.l1_loss(
+            src_bbox_vis, target_bbox_vis, reduction='sum') / num_gts
+        loss[name_giou_vis] = self.giou_loss(
+            bbox_cxcywh_to_xyxy(src_bbox_vis), bbox_cxcywh_to_xyxy(target_bbox_vis))
+        loss[name_giou_vis] = loss[name_giou_vis].sum() / num_gts
+        loss[name_giou_vis] = self.loss_coeff['giou'] * loss[name_giou_vis]
+
+        src_bbox_ir, target_bbox_ir = self._get_src_target_assign(boxes_ir, gt_bbox_ir,
+                                                                    match_indices)
+        loss[name_bbox_ir] = self.loss_coeff['bbox'] * F.l1_loss(
+            src_bbox_ir, target_bbox_ir, reduction='sum') / num_gts
+        loss[name_giou_ir] = self.giou_loss(
+            bbox_cxcywh_to_xyxy(src_bbox_ir), bbox_cxcywh_to_xyxy(target_bbox_ir))
+        loss[name_giou_ir] = loss[name_giou_ir].sum() / num_gts
+        loss[name_giou_ir] = self.loss_coeff['giou'] * loss[name_giou_ir]
+        return loss
+
+    def _get_loss_mask(self, masks, gt_mask, match_indices, num_gts,
+                       postfix=""):
+        # masks: [b, query, h, w], gt_mask: list[[n, H, W]]
+        name_mask = "loss_mask" + postfix
+        name_dice = "loss_dice" + postfix
+
+        loss = dict()
+        if sum(len(a) for a in gt_mask) == 0:
+            loss[name_mask] = paddle.to_tensor([0.])
+            loss[name_dice] = paddle.to_tensor([0.])
+            return loss
+
+        src_masks, target_masks = self._get_src_target_assign(masks, gt_mask,
+                                                              match_indices)
+        src_masks = F.interpolate(
+            src_masks.unsqueeze(0),
+            size=target_masks.shape[-2:],
+            mode="bilinear")[0]
+        loss[name_mask] = self.loss_coeff['mask'] * F.sigmoid_focal_loss(
+            src_masks,
+            target_masks,
+            paddle.to_tensor(
+                [num_gts], dtype='float32'))
+        loss[name_dice] = self.loss_coeff['dice'] * self._dice_loss(
+            src_masks, target_masks, num_gts)
+        return loss
+
+    def _dice_loss(self, inputs, targets, num_gts):
+        inputs = F.sigmoid(inputs)
+        inputs = inputs.flatten(1)
+        targets = targets.flatten(1)
+        numerator = 2 * (inputs * targets).sum(1)
+        denominator = inputs.sum(-1) + targets.sum(-1)
+        loss = 1 - (numerator + 1) / (denominator + 1)
+        return loss.sum() / num_gts
+
+    def _get_loss_aux(self,
+                      boxes_vis,
+                      boxes_ir,
+                      logits,
+                      gt_bbox_vis,
+                      gt_bbox_ir,
+                      gt_class,
+                      bg_index,
+                      num_gts,
+                      dn_match_indices=None,
+                      postfix="",
+                      masks=None,
+                      gt_mask=None):
+        loss_class = []
+        loss_bbox_vis, loss_giou_vis = [], []
+        loss_bbox_ir, loss_giou_ir = [], []
+        loss_mask, loss_dice = [], []
+        if dn_match_indices is not None:
+            match_indices = dn_match_indices
+        elif self.use_uni_match:
+            match_indices = self.matcher(
+                boxes_vis[self.uni_match_ind],
+                boxes_ir[self.uni_match_ind],
+                logits[self.uni_match_ind],
+                gt_bbox_vis,
+                gt_bbox_ir,
+                gt_class,
+                masks=masks[self.uni_match_ind] if masks is not None else None,
+                gt_mask=gt_mask)
+        for i, (aux_boxes_vis, aux_boxes_ir, aux_logits) in enumerate(zip(boxes_vis, boxes_ir, logits)):
+            aux_masks = masks[i] if masks is not None else None
+            if not self.use_uni_match and dn_match_indices is None:
+                match_indices = self.matcher(
+                    aux_boxes_vis,
+                    aux_boxes_ir,
+                    aux_logits,
+                    gt_bbox_vis,
+                    gt_bbox_ir,
+                    gt_class,
+                    masks=aux_masks,
+                    gt_mask=gt_mask)
+            if self.use_vfl:
+                if sum(len(a) for a in gt_bbox_vis) > 0:
+                    src_bbox_vis, target_bbox_vis = self._get_src_target_assign(
+                        aux_boxes_vis.detach(), gt_bbox_vis, match_indices)
+                    iou_score_vis = bbox_iou(
+                        bbox_cxcywh_to_xyxy(src_bbox_vis).split(4, -1),
+                        bbox_cxcywh_to_xyxy(target_bbox_vis).split(4, -1))
+
+                    src_bbox_ir, target_bbox_ir = self._get_src_target_assign(
+                        aux_boxes_ir.detach(), gt_bbox_ir, match_indices)
+                    iou_score_ir = bbox_iou(
+                        bbox_cxcywh_to_xyxy(src_bbox_ir).split(4, -1),
+                        bbox_cxcywh_to_xyxy(target_bbox_ir).split(4, -1))
+                else:
+                    iou_score_vis = None
+                    iou_score_ir = None
+            else:
+                iou_score_vis = None
+                iou_score_ir = None
+            loss_class.append(
+                self._get_loss_class(aux_logits, gt_class, match_indices,
+                                     bg_index, num_gts, postfix, iou_score_vis, iou_score_ir)[
+                                         'loss_class' + postfix])
+            loss_ = self._get_loss_bbox(aux_boxes_vis, aux_boxes_ir, gt_bbox_vis, gt_bbox_ir, match_indices,
+                                        num_gts, postfix)
+            loss_bbox_vis.append(loss_['loss_bbox_vis' + postfix])
+            loss_giou_ir.append(loss_['loss_giou_ir' + postfix])
+            loss_bbox_ir.append(loss_['loss_bbox_ir' + postfix])
+            loss_giou_vis.append(loss_['loss_giou_vis' + postfix])
+            if masks is not None and gt_mask is not None:
+                loss_ = self._get_loss_mask(aux_masks, gt_mask, match_indices,
+                                            num_gts, postfix)
+                loss_mask.append(loss_['loss_mask' + postfix])
+                loss_dice.append(loss_['loss_dice' + postfix])
+        loss = {
+            "loss_class_aux" + postfix: paddle.add_n(loss_class),
+            "loss_bbox_aux_vis" + postfix: paddle.add_n(loss_bbox_vis),
+            "loss_giou_aux_vis" + postfix: paddle.add_n(loss_giou_vis),
+            "loss_bbox_aux_ir" + postfix: paddle.add_n(loss_bbox_ir),
+            "loss_giou_aux_ir" + postfix: paddle.add_n(loss_giou_ir)
+        }
+        if masks is not None and gt_mask is not None:
+            loss["loss_mask_aux" + postfix] = paddle.add_n(loss_mask)
+            loss["loss_dice_aux" + postfix] = paddle.add_n(loss_dice)
+        return loss
+
+    def _get_index_updates(self, num_query_objects, target, match_indices):
+        batch_idx = paddle.concat([
+            paddle.full_like(src, i) for i, (src, _) in enumerate(match_indices)
+        ])
+        src_idx = paddle.concat([src for (src, _) in match_indices])
+        src_idx += (batch_idx * num_query_objects)
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, dst, axis=0) for t, (_, dst) in zip(target, match_indices)
+        ])
+        return src_idx, target_assign
+
+    def _get_src_target_assign(self, src, target, match_indices):
+        src_assign = paddle.concat([
+            paddle.gather(
+                t, I, axis=0) if len(I) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (I, _) in zip(src, match_indices)
+        ])
+        target_assign = paddle.concat([
+            paddle.gather(
+                t, J, axis=0) if len(J) > 0 else paddle.zeros([0, t.shape[-1]])
+            for t, (_, J) in zip(target, match_indices)
+        ])
+        return src_assign, target_assign
+
+    def _get_num_gts(self, targets, dtype="float32"):
+        num_gts = sum(len(a) for a in targets)
+        num_gts = paddle.to_tensor([num_gts], dtype=dtype)
+        if paddle.distributed.get_world_size() > 1:
+            paddle.distributed.all_reduce(num_gts)
+            num_gts /= paddle.distributed.get_world_size()
+        num_gts = paddle.clip(num_gts, min=1.)
+        return num_gts
+
+    def _get_prediction_loss(self,
+                             boxes_vis,
+                             boxes_ir,
+                             logits,
+                             gt_bbox_vis,
+                             gt_bbox_ir,
+                             gt_class,
+                             masks=None,
+                             gt_mask=None,
+                             postfix="",
+                             dn_match_indices=None,
+                             num_gts=1):
+        if dn_match_indices is None:
+            match_indices = self.matcher(
+                boxes_vis, boxes_ir, logits, gt_bbox_vis, gt_bbox_ir, gt_class, masks=masks, gt_mask=gt_mask)
+        else:
+            match_indices = dn_match_indices
+
+        if self.use_vfl:
+            if sum(len(a) for a in gt_bbox_vis) > 0:
+                src_bbox_vis, target_bbox_vis = self._get_src_target_assign(
+                    boxes_vis.detach(), gt_bbox_vis, match_indices)
+                iou_score_vis = bbox_iou(
+                    bbox_cxcywh_to_xyxy(src_bbox_vis).split(4, -1),
+                    bbox_cxcywh_to_xyxy(target_bbox_vis).split(4, -1))
+
+                src_bbox_ir, target_bbox_ir = self._get_src_target_assign(
+                    boxes_ir.detach(), gt_bbox_ir, match_indices)
+                iou_score_ir = bbox_iou(
+                    bbox_cxcywh_to_xyxy(src_bbox_ir).split(4, -1),
+                    bbox_cxcywh_to_xyxy(target_bbox_ir).split(4, -1))
+
+            else:
+                iou_score_vis = None
+                iou_score_ir = None
+        else:
+            iou_score_vis = None
+            iou_score_ir = None
+
+        loss = dict()
+        loss.update(
+            self._get_loss_class(logits, gt_class, match_indices,
+                                 self.num_classes, num_gts, postfix, iou_score_vis, iou_score_ir))
+        loss.update(
+            self._get_loss_bbox(boxes_vis, boxes_ir, gt_bbox_vis, gt_bbox_ir, match_indices, num_gts,
+                                postfix))
+        if masks is not None and gt_mask is not None:
+            loss.update(
+                self._get_loss_mask(masks, gt_mask, match_indices, num_gts,
+                                    postfix))
+        return loss
+
+    def forward(self,
+                boxes_vis,
+                boxes_ir,
+                logits,
+                gt_bbox_vis,
+                gt_bbox_ir,
+                gt_class,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                **kwargs):
+        r"""
+        Args:
+            boxes (Tensor): [l, b, query, 4]
+            logits (Tensor): [l, b, query, num_classes]
+            gt_bbox (List(Tensor)): list[[n, 4]]
+            gt_class (List(Tensor)): list[[n, 1]]
+            masks (Tensor, optional): [l, b, query, h, w]
+            gt_mask (List(Tensor), optional): list[[n, H, W]]
+            postfix (str): postfix of loss name
+        """
+
+        dn_match_indices = kwargs.get("dn_match_indices", None)
+        num_gts = kwargs.get("num_gts", None)
+        if num_gts is None:
+            num_gts = self._get_num_gts(gt_class)
+
+        total_loss = self._get_prediction_loss(
+            boxes_vis[-1],
+            boxes_ir[-1],
+            logits[-1],
+            gt_bbox_vis,
+            gt_bbox_ir,
+            gt_class,
+            masks=masks[-1] if masks is not None else None,
+            gt_mask=gt_mask,
+            postfix=postfix,
+            dn_match_indices=dn_match_indices,
+            num_gts=num_gts)
+
+        if self.aux_loss:
+            total_loss.update(
+                self._get_loss_aux(
+                    boxes_vis[:-1],
+                    boxes_ir[:-1],
+                    logits[:-1],
+                    gt_bbox_vis,
+                    gt_bbox_ir,
+                    gt_class,
+                    self.num_classes,
+                    num_gts,
+                    dn_match_indices,
+                    postfix,
+                    masks=masks[:-1] if masks is not None else None,
+                    gt_mask=gt_mask))
+
+        return total_loss
+
+
+@register
+class DINOLoss(DETRLoss):
+    def forward(self,
+                boxes,
+                logits,
+                gt_bbox,
+                gt_class,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                dn_out_bboxes=None,
+                dn_out_logits=None,
+                dn_meta=None,
+                dec_out=None,
+                all_feats=None,
+                inputs=None,
+                generate_vis_pic=None,
+                generate_ir_pic=None,
+                **kwargs):
+        num_gts = self._get_num_gts(gt_class)
+        num_quires = 300
+        if self.group:
+            total_loss = {}
+            boxes = paddle.split(boxes,3,axis=2)
+            logits = paddle.split(logits,3,axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+        elif self.groupx5:
+            total_loss = {}
+            dec_out_loss_vis = 0
+            dec_out_loss_ir = 0
+            # dec_out loss
+            for dec_out_l in dec_out:
+                dec_out_l_f_vis = dec_out_l[:,-num_quires*4:-num_quires*3,:]
+                dec_out_l_f_ir = dec_out_l[:,-num_quires*3:-num_quires*2,:]
+                dec_out_l_vis = dec_out_l[:,-num_quires*2:-num_quires,:]
+                dec_out_l_ir = dec_out_l[:,-num_quires:,:]
+                dec_out_loss_vis = dec_out_loss_vis + paddle.nn.functional.mse_loss(dec_out_l_f_vis,dec_out_l_vis,reduction='mean')
+                dec_out_loss_ir = dec_out_loss_ir + paddle.nn.functional.mse_loss(dec_out_l_f_ir,dec_out_l_ir,reduction='mean')
+
+
+            boxes = paddle.split(boxes, 5, axis=2)
+            logits = paddle.split(logits, 5, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss4 = super(DINOLoss, self).forward(
+                boxes[3], logits[3], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss5 = super(DINOLoss, self).forward(
+                boxes[4], logits[4], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]+ total_loss4[key] + total_loss5[key]) / 5
+            total_loss['dec_out_loss_vis'] = dec_out_loss_vis
+            total_loss['dec_out_loss_ir'] = dec_out_loss_ir
+        elif self.groupx3_v3:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+            vis_feats = all_feats[:3]
+            ir_feats = all_feats[3:6]
+            vis_feats_g = all_feats[6:9]
+            ir_feats_g = all_feats[9:12]
+            for mm in range(3):
+                vis_feats_d = vis_feats[mm].detach()
+                ir_feats_d = ir_feats[mm].detach()
+                # vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_d, vis_feats_g[mm],
+                #                                                         reduction='mean')
+                # ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_d, ir_feats_g[mm],
+                #                                                       reduction='mean')
+                vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_g[mm],vis_feats_d,
+                                                                        reduction='mean')
+                ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss( ir_feats_g[mm],ir_feats_d,
+                                                                      reduction='mean')
+
+
+            total_loss['vis_g_loss'] = vis_g_loss
+            total_loss['ir_g_loss'] = ir_g_loss
+
+        elif self.groupx3_v4:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+            # vis_feats = all_feats[:3]
+            # ir_feats = all_feats[3:6]
+            # vis_feats_g = all_feats[6:9]
+            # ir_feats_g = all_feats[9:12]
+            # for mm in range(3):
+            #     vis_feats_d = vis_feats[mm].detach()
+            #     ir_feats_d = ir_feats[mm].detach()
+            #     # vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_d, vis_feats_g[mm],
+            #     #                                                         reduction='mean')
+            #     # ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_d, ir_feats_g[mm],
+            #     #                                                       reduction='mean')
+            #     vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_g[mm],vis_feats_d,
+            #                                                             reduction='mean')
+            #     ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_g[mm],ir_feats_d,
+            #                                                           reduction='mean')
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.mse_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.mse_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx3_v5:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.l1_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.l1_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_l1loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_l1loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx3_v6:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.l1_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.l1_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_l1loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_l1loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx4:
+            total_loss = {}
+
+            boxes = paddle.split(boxes, 4, axis=2)
+            logits = paddle.split(logits, 4, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss4 = super(DINOLoss, self).forward(
+                boxes[3], logits[3], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (
+                            total_loss1[key] * 0.4 + total_loss2[key] * 0.2 + total_loss3[key] * 0.2 + total_loss4[
+                        key] * 0.2)
+
+        else:
+            total_loss = super(DINOLoss, self).forward(
+                boxes, logits, gt_bbox, gt_class, num_gts=num_gts)
+
+        if dn_meta is not None:
+            dn_positive_idx, dn_num_group = \
+                dn_meta["dn_positive_idx"], dn_meta["dn_num_group"]
+            assert len(gt_class) == len(dn_positive_idx)
+
+            # denoising match indices
+            dn_match_indices = self.get_dn_match_indices(
+                gt_class, dn_positive_idx, dn_num_group)
+
+            # compute denoising training loss
+            num_gts *= dn_num_group
+            dn_loss = super(DINOLoss, self).forward(
+                dn_out_bboxes,
+                dn_out_logits,
+                gt_bbox,
+                gt_class,
+                postfix="_dn",
+                dn_match_indices=dn_match_indices,
+                num_gts=num_gts)
+            total_loss.update(dn_loss)
+        else:
+            total_loss.update(
+                {k + '_dn': paddle.to_tensor([0.])
+                 for k in total_loss.keys()})
+
+        return total_loss
+
+    @staticmethod
+    def get_dn_match_indices(labels, dn_positive_idx, dn_num_group):
+        dn_match_indices = []
+        for i in range(len(labels)):
+            num_gt = len(labels[i])
+            if num_gt > 0:
+                gt_idx = paddle.arange(end=num_gt, dtype="int64")
+                gt_idx = gt_idx.tile([dn_num_group])
+                assert len(dn_positive_idx[i]) == len(gt_idx)
+                dn_match_indices.append((dn_positive_idx[i], gt_idx))
+            else:
+                dn_match_indices.append((paddle.zeros(
+                    [0], dtype="int64"), paddle.zeros(
+                        [0], dtype="int64")))
+        return dn_match_indices
+
+
+@register
+class DINOLoss_Rotate(DETRLoss_Rotate):
+    def forward(self,
+                boxes,
+                logits,
+                angles_cls,
+                gt_bbox,
+                gt_class,
+                im_shape,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                dn_out_bboxes=None,
+                dn_out_logits=None,
+                dn_out_angle_cls=None,
+                dn_meta=None,
+                dec_out=None,
+                all_feats=None,
+                inputs=None,
+                generate_vis_pic=None,
+                generate_ir_pic=None,
+                paired_gt_rbox_match_shape=None,
+                paired_gt_rbox_unmatch_shape=None,
+                **kwargs):
+        num_gts = self._get_num_gts(gt_class)
+        num_quires = 300
+        if self.group:
+            total_loss = {}
+            boxes = paddle.split(boxes,3,axis=2)
+            logits = paddle.split(logits,3,axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+        elif self.groupx5:
+            total_loss = {}
+            dec_out_loss_vis = 0
+            dec_out_loss_ir = 0
+            # dec_out loss
+            for dec_out_l in dec_out:
+                dec_out_l_f_vis = dec_out_l[:,-num_quires*4:-num_quires*3,:]
+                dec_out_l_f_ir = dec_out_l[:,-num_quires*3:-num_quires*2,:]
+                dec_out_l_vis = dec_out_l[:,-num_quires*2:-num_quires,:]
+                dec_out_l_ir = dec_out_l[:,-num_quires:,:]
+                dec_out_loss_vis = dec_out_loss_vis + paddle.nn.functional.mse_loss(dec_out_l_f_vis,dec_out_l_vis,reduction='mean')
+                dec_out_loss_ir = dec_out_loss_ir + paddle.nn.functional.mse_loss(dec_out_l_f_ir,dec_out_l_ir,reduction='mean')
+
+
+            boxes = paddle.split(boxes, 5, axis=2)
+            logits = paddle.split(logits, 5, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss4 = super(DINOLoss, self).forward(
+                boxes[3], logits[3], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss5 = super(DINOLoss, self).forward(
+                boxes[4], logits[4], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]+ total_loss4[key] + total_loss5[key]) / 5
+            total_loss['dec_out_loss_vis'] = dec_out_loss_vis
+            total_loss['dec_out_loss_ir'] = dec_out_loss_ir
+        elif self.groupx3_v3:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+            vis_feats = all_feats[:3]
+            ir_feats = all_feats[3:6]
+            vis_feats_g = all_feats[6:9]
+            ir_feats_g = all_feats[9:12]
+            for mm in range(3):
+                vis_feats_d = vis_feats[mm].detach()
+                ir_feats_d = ir_feats[mm].detach()
+                # vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_d, vis_feats_g[mm],
+                #                                                         reduction='mean')
+                # ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_d, ir_feats_g[mm],
+                #                                                       reduction='mean')
+                vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_g[mm],vis_feats_d,
+                                                                        reduction='mean')
+                ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss( ir_feats_g[mm],ir_feats_d,
+                                                                      reduction='mean')
+
+
+            total_loss['vis_g_loss'] = vis_g_loss
+            total_loss['ir_g_loss'] = ir_g_loss
+
+        elif self.groupx3_v4:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+            # vis_feats = all_feats[:3]
+            # ir_feats = all_feats[3:6]
+            # vis_feats_g = all_feats[6:9]
+            # ir_feats_g = all_feats[9:12]
+            # for mm in range(3):
+            #     vis_feats_d = vis_feats[mm].detach()
+            #     ir_feats_d = ir_feats[mm].detach()
+            #     # vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_d, vis_feats_g[mm],
+            #     #                                                         reduction='mean')
+            #     # ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_d, ir_feats_g[mm],
+            #     #                                                       reduction='mean')
+            #     vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_g[mm],vis_feats_d,
+            #                                                             reduction='mean')
+            #     ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_g[mm],ir_feats_d,
+            #                                                           reduction='mean')
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.mse_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.mse_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx3_v5:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.l1_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.l1_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_l1loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_l1loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx3_v6:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.l1_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.l1_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_l1loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_l1loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx4:
+            total_loss = {}
+
+            boxes = paddle.split(boxes, 4, axis=2)
+            logits = paddle.split(logits, 4, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss4 = super(DINOLoss, self).forward(
+                boxes[3], logits[3], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (
+                            total_loss1[key] * 0.4 + total_loss2[key] * 0.2 + total_loss3[key] * 0.2 + total_loss4[
+                        key] * 0.2)
+
+        else:
+            total_loss = super(DINOLoss_Rotate, self).forward(
+                boxes, logits,angles_cls, gt_bbox, gt_class,im_shape, num_gts=num_gts,paired_gt_rbox_match_shape=paired_gt_rbox_match_shape,paired_gt_rbox_unmatch_shape=paired_gt_rbox_unmatch_shape)
+
+        if dn_meta is not None:
+            dn_positive_idx, dn_num_group = \
+                dn_meta["dn_positive_idx"], dn_meta["dn_num_group"]
+            assert len(gt_class) == len(dn_positive_idx)
+
+            # denoising match indices
+            dn_match_indices = self.get_dn_match_indices(
+                gt_class, dn_positive_idx, dn_num_group)
+
+            # compute denoising training loss
+            num_gts *= dn_num_group
+            dn_loss = super(DINOLoss_Rotate, self).forward(
+                dn_out_bboxes,
+                dn_out_logits,
+                dn_out_angle_cls,
+                gt_bbox,
+                gt_class,
+                im_shape,
+                postfix="_dn",
+                dn_match_indices=dn_match_indices,
+                num_gts=num_gts,
+                paired_gt_rbox_match_shape=paired_gt_rbox_match_shape,
+                paired_gt_rbox_unmatch_shape=paired_gt_rbox_unmatch_shape)
+            total_loss.update(dn_loss)
+        else:
+            total_loss.update(
+                {k + '_dn': paddle.to_tensor([0.])
+                 for k in total_loss.keys()})
+
+        return total_loss
+
+    @staticmethod
+    def get_dn_match_indices(labels, dn_positive_idx, dn_num_group):
+        dn_match_indices = []
+        for i in range(len(labels)):
+            num_gt = len(labels[i])
+            if num_gt > 0:
+                gt_idx = paddle.arange(end=num_gt, dtype="int64")
+                gt_idx = gt_idx.tile([dn_num_group])
+                assert len(dn_positive_idx[i]) == len(gt_idx)
+                dn_match_indices.append((dn_positive_idx[i], gt_idx))
+            else:
+                dn_match_indices.append((paddle.zeros(
+                    [0], dtype="int64"), paddle.zeros(
+                        [0], dtype="int64")))
+        return dn_match_indices
+
+
+@register
+class DINOLoss_Rotate_Paired(DETRLoss_Rotate_Paired):
+    def forward(self,
+                boxes_vis,
+                boxes_ir,
+                logits,
+                angles_cls_vis,
+                angles_cls_ir,
+                gt_bbox_vis,
+                gt_bbox_ir,
+                gt_class,
+                im_shape,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                dn_out_bboxes_vis=None,
+                dn_out_bboxes_ir=None,
+                dn_out_logits=None,
+                dn_out_angle_cls_vis=None,
+                dn_out_angle_cls_ir=None,
+                dn_meta=None,
+                dec_out=None,
+                all_feats=None,
+                inputs=None,
+                generate_vis_pic=None,
+                generate_ir_pic=None,
+                paired_gt_rbox_match_shape=None,
+                paired_gt_rbox_unmatch_shape=None,
+                **kwargs):
+        self.paired_gt_rbox_match_shape=paired_gt_rbox_match_shape
+        self.paired_gt_rbox_unmatch_shape=paired_gt_rbox_unmatch_shape
+        num_gts = self._get_num_gts(gt_class)
+        num_quires = 300
+        if self.group:
+            total_loss = {}
+            boxes = paddle.split(boxes,3,axis=2)
+            logits = paddle.split(logits,3,axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+        elif self.groupx5:
+            total_loss = {}
+            dec_out_loss_vis = 0
+            dec_out_loss_ir = 0
+            # dec_out loss
+            for dec_out_l in dec_out:
+                dec_out_l_f_vis = dec_out_l[:,-num_quires*4:-num_quires*3,:]
+                dec_out_l_f_ir = dec_out_l[:,-num_quires*3:-num_quires*2,:]
+                dec_out_l_vis = dec_out_l[:,-num_quires*2:-num_quires,:]
+                dec_out_l_ir = dec_out_l[:,-num_quires:,:]
+                dec_out_loss_vis = dec_out_loss_vis + paddle.nn.functional.mse_loss(dec_out_l_f_vis,dec_out_l_vis,reduction='mean')
+                dec_out_loss_ir = dec_out_loss_ir + paddle.nn.functional.mse_loss(dec_out_l_f_ir,dec_out_l_ir,reduction='mean')
+
+
+            boxes = paddle.split(boxes, 5, axis=2)
+            logits = paddle.split(logits, 5, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss4 = super(DINOLoss, self).forward(
+                boxes[3], logits[3], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss5 = super(DINOLoss, self).forward(
+                boxes[4], logits[4], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]+ total_loss4[key] + total_loss5[key]) / 5
+            total_loss['dec_out_loss_vis'] = dec_out_loss_vis
+            total_loss['dec_out_loss_ir'] = dec_out_loss_ir
+        elif self.groupx3_v3:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+            vis_feats = all_feats[:3]
+            ir_feats = all_feats[3:6]
+            vis_feats_g = all_feats[6:9]
+            ir_feats_g = all_feats[9:12]
+            for mm in range(3):
+                vis_feats_d = vis_feats[mm].detach()
+                ir_feats_d = ir_feats[mm].detach()
+                # vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_d, vis_feats_g[mm],
+                #                                                         reduction='mean')
+                # ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_d, ir_feats_g[mm],
+                #                                                       reduction='mean')
+                vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_g[mm],vis_feats_d,
+                                                                        reduction='mean')
+                ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss( ir_feats_g[mm],ir_feats_d,
+                                                                      reduction='mean')
+
+
+            total_loss['vis_g_loss'] = vis_g_loss
+            total_loss['ir_g_loss'] = ir_g_loss
+
+        elif self.groupx3_v4:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+            # vis_feats = all_feats[:3]
+            # ir_feats = all_feats[3:6]
+            # vis_feats_g = all_feats[6:9]
+            # ir_feats_g = all_feats[9:12]
+            # for mm in range(3):
+            #     vis_feats_d = vis_feats[mm].detach()
+            #     ir_feats_d = ir_feats[mm].detach()
+            #     # vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_d, vis_feats_g[mm],
+            #     #                                                         reduction='mean')
+            #     # ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_d, ir_feats_g[mm],
+            #     #                                                       reduction='mean')
+            #     vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_g[mm],vis_feats_d,
+            #                                                             reduction='mean')
+            #     ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_g[mm],ir_feats_d,
+            #                                                           reduction='mean')
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.mse_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.mse_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx3_v5:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.l1_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.l1_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_l1loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_l1loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx3_v6:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.l1_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.l1_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_l1loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_l1loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx4:
+            total_loss = {}
+
+            boxes = paddle.split(boxes, 4, axis=2)
+            logits = paddle.split(logits, 4, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss4 = super(DINOLoss, self).forward(
+                boxes[3], logits[3], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (
+                            total_loss1[key] * 0.4 + total_loss2[key] * 0.2 + total_loss3[key] * 0.2 + total_loss4[
+                        key] * 0.2)
+
+        else:
+            total_loss = super(DINOLoss_Rotate_Paired, self).forward(
+                boxes_vis,boxes_ir, logits,angles_cls_vis,angles_cls_ir, gt_bbox_vis,gt_bbox_ir, gt_class,im_shape, num_gts=num_gts,)
+
+        if dn_meta is not None:
+            dn_positive_idx, dn_num_group = \
+                dn_meta["dn_positive_idx"], dn_meta["dn_num_group"]
+            assert len(gt_class) == len(dn_positive_idx)
+
+            # denoising match indices
+            dn_match_indices = self.get_dn_match_indices(
+                gt_class, dn_positive_idx, dn_num_group)
+
+            # compute denoising training loss
+            num_gts *= dn_num_group
+            dn_loss = super(DINOLoss_Rotate_Paired, self).forward(
+                dn_out_bboxes_vis,
+                dn_out_bboxes_ir,
+                dn_out_logits,
+                dn_out_angle_cls_vis,
+                dn_out_angle_cls_ir,
+                gt_bbox_vis,
+                gt_bbox_ir,
+                gt_class,
+                im_shape,
+                postfix="_dn",
+                dn_match_indices=dn_match_indices,
+                num_gts=num_gts)
+            total_loss.update(dn_loss)
+        else:
+            total_loss.update(
+                {k + '_dn': paddle.to_tensor([0.])
+                 for k in total_loss.keys()})
+
+        return total_loss
+
+    @staticmethod
+    def get_dn_match_indices(labels, dn_positive_idx, dn_num_group):
+        dn_match_indices = []
+        for i in range(len(labels)):
+            num_gt = len(labels[i])
+            if num_gt > 0:
+                gt_idx = paddle.arange(end=num_gt, dtype="int64")
+                gt_idx = gt_idx.tile([dn_num_group])
+                assert len(dn_positive_idx[i]) == len(gt_idx)
+                dn_match_indices.append((dn_positive_idx[i], gt_idx))
+            else:
+                dn_match_indices.append((paddle.zeros(
+                    [0], dtype="int64"), paddle.zeros(
+                        [0], dtype="int64")))
+        return dn_match_indices
+
+@register
+class DINOLoss_Paired(DETRLoss_Paired):
+    def forward(self,
+                boxes_vis,
+                boxes_ir,
+                logits,
+                gt_bbox_vis,
+                gt_bbox_ir,
+                gt_class,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                dn_out_bboxes_vis=None,
+                dn_out_bboxes_ir=None,
+                dn_out_logits=None,
+                dn_meta=None,
+                dec_out=None,
+                all_feats=None,
+                inputs=None,
+                generate_vis_pic=None,
+                generate_ir_pic=None,
+                **kwargs):
+        num_gts = self._get_num_gts(gt_class)
+        num_quires = 300
+        if self.group:
+            total_loss = {}
+            boxes_vis = paddle.split(boxes_vis,3,axis=2)
+            boxes_ir = paddle.split(boxes_ir, 3, axis=2)
+            logits = paddle.split(logits,3,axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+        elif self.groupx5:
+            total_loss = {}
+            dec_out_loss_vis = 0
+            dec_out_loss_ir = 0
+            # dec_out loss
+            for dec_out_l in dec_out:
+                dec_out_l_f_vis = dec_out_l[:,-num_quires*4:-num_quires*3,:]
+                dec_out_l_f_ir = dec_out_l[:,-num_quires*3:-num_quires*2,:]
+                dec_out_l_vis = dec_out_l[:,-num_quires*2:-num_quires,:]
+                dec_out_l_ir = dec_out_l[:,-num_quires:,:]
+                dec_out_loss_vis = dec_out_loss_vis + paddle.nn.functional.mse_loss(dec_out_l_f_vis,dec_out_l_vis,reduction='mean')
+                dec_out_loss_ir = dec_out_loss_ir + paddle.nn.functional.mse_loss(dec_out_l_f_ir,dec_out_l_ir,reduction='mean')
+
+
+            boxes = paddle.split(boxes, 5, axis=2)
+            logits = paddle.split(logits, 5, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss4 = super(DINOLoss, self).forward(
+                boxes[3], logits[3], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss5 = super(DINOLoss, self).forward(
+                boxes[4], logits[4], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]+ total_loss4[key] + total_loss5[key]) / 5
+            total_loss['dec_out_loss_vis'] = dec_out_loss_vis
+            total_loss['dec_out_loss_ir'] = dec_out_loss_ir
+        elif self.groupx3_v3:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+            vis_feats = all_feats[:3]
+            ir_feats = all_feats[3:6]
+            vis_feats_g = all_feats[6:9]
+            ir_feats_g = all_feats[9:12]
+            for mm in range(3):
+                vis_feats_d = vis_feats[mm].detach()
+                ir_feats_d = ir_feats[mm].detach()
+                # vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_d, vis_feats_g[mm],
+                #                                                         reduction='mean')
+                # ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_d, ir_feats_g[mm],
+                #                                                       reduction='mean')
+                vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_g[mm],vis_feats_d,
+                                                                        reduction='mean')
+                ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss( ir_feats_g[mm],ir_feats_d,
+                                                                      reduction='mean')
+
+
+            total_loss['vis_g_loss'] = vis_g_loss
+            total_loss['ir_g_loss'] = ir_g_loss
+
+        elif self.groupx3_v4:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+            # vis_feats = all_feats[:3]
+            # ir_feats = all_feats[3:6]
+            # vis_feats_g = all_feats[6:9]
+            # ir_feats_g = all_feats[9:12]
+            # for mm in range(3):
+            #     vis_feats_d = vis_feats[mm].detach()
+            #     ir_feats_d = ir_feats[mm].detach()
+            #     # vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_d, vis_feats_g[mm],
+            #     #                                                         reduction='mean')
+            #     # ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_d, ir_feats_g[mm],
+            #     #                                                       reduction='mean')
+            #     vis_g_loss = vis_g_loss + paddle.nn.functional.mse_loss(vis_feats_g[mm],vis_feats_d,
+            #                                                             reduction='mean')
+            #     ir_g_loss = ir_g_loss + paddle.nn.functional.mse_loss(ir_feats_g[mm],ir_feats_d,
+            #                                                           reduction='mean')
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.mse_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.mse_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx3_v5:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.l1_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.l1_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_l1loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_l1loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx3_v6:
+            total_loss = {}
+            vis_g_loss = 0
+            ir_g_loss = 0
+            boxes = paddle.split(boxes, 3, axis=2)
+            logits = paddle.split(logits, 3, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (total_loss1[key] + total_loss2[key] + total_loss3[key]) / 3
+
+            gt_vis_pic = inputs['vis_image']
+            gt_ir_pic = inputs['ir_image']
+            vis_g_pic_loss = paddle.nn.functional.l1_loss(generate_vis_pic,gt_vis_pic ,
+                                                                      reduction='mean')
+            ir_g_pic_loss = paddle.nn.functional.l1_loss(generate_ir_pic,gt_ir_pic ,
+                                                                      reduction='mean')
+
+            total_loss['vis_g_pic_l1loss'] = vis_g_pic_loss * 10
+            total_loss['ir_g_pic_l1loss'] = ir_g_pic_loss * 10
+
+        elif self.groupx4:
+            total_loss = {}
+
+            boxes = paddle.split(boxes, 4, axis=2)
+            logits = paddle.split(logits, 4, axis=2)
+            total_loss1 = super(DINOLoss, self).forward(
+                boxes[0], logits[0], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss2 = super(DINOLoss, self).forward(
+                boxes[1], logits[1], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss3 = super(DINOLoss, self).forward(
+                boxes[2], logits[2], gt_bbox, gt_class, num_gts=num_gts)
+            total_loss4 = super(DINOLoss, self).forward(
+                boxes[3], logits[3], gt_bbox, gt_class, num_gts=num_gts)
+            for key in total_loss1:
+                total_loss[key] = (
+                            total_loss1[key] * 0.4 + total_loss2[key] * 0.2 + total_loss3[key] * 0.2 + total_loss4[
+                        key] * 0.2)
+
+        else:
+            total_loss = super(DINOLoss_Paired, self).forward(
+                boxes_vis, boxes_ir, logits, gt_bbox_vis, gt_bbox_ir, gt_class, num_gts=num_gts)
+
+        if dn_meta is not None:
+            dn_positive_idx, dn_num_group = \
+                dn_meta["dn_positive_idx"], dn_meta["dn_num_group"]
+            assert len(gt_class) == len(dn_positive_idx)
+
+            # denoising match indices
+            dn_match_indices = self.get_dn_match_indices(
+                gt_class, dn_positive_idx, dn_num_group)
+
+            # compute denoising training loss
+            num_gts *= dn_num_group
+            dn_loss = super(DINOLoss_Paired, self).forward(
+                dn_out_bboxes_vis,
+                dn_out_bboxes_ir,
+                dn_out_logits,
+                gt_bbox_vis,
+                gt_bbox_ir,
+                gt_class,
+                postfix="_dn",
+                dn_match_indices=dn_match_indices,
+                num_gts=num_gts)
+            total_loss.update(dn_loss)
+        else:
+            total_loss.update(
+                {k + '_dn': paddle.to_tensor([0.])
+                 for k in total_loss.keys()})
+
+        return total_loss
+
+    @staticmethod
+    def get_dn_match_indices(labels, dn_positive_idx, dn_num_group):
+        dn_match_indices = []
+        for i in range(len(labels)):
+            num_gt = len(labels[i])
+            if num_gt > 0:
+                gt_idx = paddle.arange(end=num_gt, dtype="int64")
+                gt_idx = gt_idx.tile([dn_num_group])
+                assert len(dn_positive_idx[i]) == len(gt_idx)
+                dn_match_indices.append((dn_positive_idx[i], gt_idx))
+            else:
+                dn_match_indices.append((paddle.zeros(
+                    [0], dtype="int64"), paddle.zeros(
+                        [0], dtype="int64")))
+        return dn_match_indices
+
+
+@register
+class MaskDINOLoss(DETRLoss):
+    __shared__ = ['num_classes', 'use_focal_loss', 'num_sample_points']
+    __inject__ = ['matcher']
+
+    def __init__(self,
+                 num_classes=80,
+                 matcher='HungarianMatcher',
+                 loss_coeff={
+                     'class': 4,
+                     'bbox': 5,
+                     'giou': 2,
+                     'mask': 5,
+                     'dice': 5
+                 },
+                 aux_loss=True,
+                 use_focal_loss=False,
+                 num_sample_points=12544,
+                 oversample_ratio=3.0,
+                 important_sample_ratio=0.75):
+        super(MaskDINOLoss, self).__init__(num_classes, matcher, loss_coeff,
+                                           aux_loss, use_focal_loss)
+        assert oversample_ratio >= 1
+        assert important_sample_ratio <= 1 and important_sample_ratio >= 0
+
+        self.num_sample_points = num_sample_points
+        self.oversample_ratio = oversample_ratio
+        self.important_sample_ratio = important_sample_ratio
+        self.num_oversample_points = int(num_sample_points * oversample_ratio)
+        self.num_important_points = int(num_sample_points *
+                                        important_sample_ratio)
+        self.num_random_points = num_sample_points - self.num_important_points
+
+    def forward(self,
+                boxes,
+                logits,
+                gt_bbox,
+                gt_class,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                dn_out_bboxes=None,
+                dn_out_logits=None,
+                dn_out_masks=None,
+                dn_meta=None,
+                **kwargs):
+        num_gts = self._get_num_gts(gt_class)
+        total_loss = super(MaskDINOLoss, self).forward(
+            boxes,
+            logits,
+            gt_bbox,
+            gt_class,
+            masks=masks,
+            gt_mask=gt_mask,
+            num_gts=num_gts)
+
+        if dn_meta is not None:
+            dn_positive_idx, dn_num_group = \
+                dn_meta["dn_positive_idx"], dn_meta["dn_num_group"]
+            assert len(gt_class) == len(dn_positive_idx)
+
+            # denoising match indices
+            dn_match_indices = DINOLoss.get_dn_match_indices(
+                gt_class, dn_positive_idx, dn_num_group)
+
+            # compute denoising training loss
+            num_gts *= dn_num_group
+            dn_loss = super(MaskDINOLoss, self).forward(
+                dn_out_bboxes,
+                dn_out_logits,
+                gt_bbox,
+                gt_class,
+                masks=dn_out_masks,
+                gt_mask=gt_mask,
+                postfix="_dn",
+                dn_match_indices=dn_match_indices,
+                num_gts=num_gts)
+            total_loss.update(dn_loss)
+        else:
+            total_loss.update(
+                {k + '_dn': paddle.to_tensor([0.])
+                 for k in total_loss.keys()})
+
+        return total_loss
+
+    def _get_loss_mask(self, masks, gt_mask, match_indices, num_gts,
+                       postfix=""):
+        # masks: [b, query, h, w], gt_mask: list[[n, H, W]]
+        name_mask = "loss_mask" + postfix
+        name_dice = "loss_dice" + postfix
+
+        loss = dict()
+        if sum(len(a) for a in gt_mask) == 0:
+            loss[name_mask] = paddle.to_tensor([0.])
+            loss[name_dice] = paddle.to_tensor([0.])
+            return loss
+
+        src_masks, target_masks = self._get_src_target_assign(masks, gt_mask,
+                                                              match_indices)
+        # sample points
+        sample_points = self._get_point_coords_by_uncertainty(src_masks)
+        sample_points = 2.0 * sample_points.unsqueeze(1) - 1.0
+
+        src_masks = F.grid_sample(
+            src_masks.unsqueeze(1), sample_points,
+            align_corners=False).squeeze([1, 2])
+
+        target_masks = F.grid_sample(
+            target_masks.unsqueeze(1), sample_points,
+            align_corners=False).squeeze([1, 2]).detach()
+
+        loss[name_mask] = self.loss_coeff[
+            'mask'] * F.binary_cross_entropy_with_logits(
+                src_masks, target_masks,
+                reduction='none').mean(1).sum() / num_gts
+        loss[name_dice] = self.loss_coeff['dice'] * self._dice_loss(
+            src_masks, target_masks, num_gts)
+        return loss
+
+    def _get_point_coords_by_uncertainty(self, masks):
+        # Sample points based on their uncertainty.
+        masks = masks.detach()
+        num_masks = masks.shape[0]
+        sample_points = paddle.rand(
+            [num_masks, 1, self.num_oversample_points, 2])
+
+        out_mask = F.grid_sample(
+            masks.unsqueeze(1), 2.0 * sample_points - 1.0,
+            align_corners=False).squeeze([1, 2])
+        out_mask = -paddle.abs(out_mask)
+
+        _, topk_ind = paddle.topk(out_mask, self.num_important_points, axis=1)
+        batch_ind = paddle.arange(end=num_masks, dtype=topk_ind.dtype)
+        batch_ind = batch_ind.unsqueeze(-1).tile([1, self.num_important_points])
+        topk_ind = paddle.stack([batch_ind, topk_ind], axis=-1)
+
+        sample_points = paddle.gather_nd(sample_points.squeeze(1), topk_ind)
+        if self.num_random_points > 0:
+            sample_points = paddle.concat(
+                [
+                    sample_points,
+                    paddle.rand([num_masks, self.num_random_points, 2])
+                ],
+                axis=1)
+        return sample_points
