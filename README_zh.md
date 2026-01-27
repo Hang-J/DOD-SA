@@ -1,6 +1,6 @@
 # DOD-SA
 
-中文 | [English](README_en.md)
+中文 | [English](README.md)
 
 本项目基于 PaddleDetection，实现了 DA-DPDETR 的配对 VIS/IR 目标检测与域自适应训练。本文档合并了两种变体：
 
