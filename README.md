@@ -49,6 +49,11 @@ Install (make sure PaddlePaddle is installed for your CUDA version first):
 pip install -r requirements.txt
 pip install -e .
 ```
+<p align="left">
+  <a href="https://drive.google.com/uc?export=download&id=1pxFaB7aLqi5Wy1ymzbiTDguuAE4U3nGu">
+    <img src="https://img.shields.io/badge/Download-Weights-blue?style=for-the-badge&logo=google-drive" alt="Download Weights">
+  </a>
+</p>
 
 ## Data Preparation
 ### HBB (KAIST / FLIR / CVC-14) — this repo
