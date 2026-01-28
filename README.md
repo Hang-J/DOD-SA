@@ -199,5 +199,4 @@ Fill in your results here:
 Built on PaddleDetection with RT-DETR / DINO components. Thanks to the open-source community.
 
 ## License
-- **This repo (HBB):** no LICENSE file is included. Add one if you plan to distribute.
-- **DroneVehicle repo (RBOX):** Apache-2.0 (see its LICENSE file).
+- **This repo (HBB):** Apache-2.0（见其 LICENSE 文件）。
