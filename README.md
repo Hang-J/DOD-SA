@@ -197,7 +197,8 @@ Fill in your results here:
 | FLIR | mAP | 85.2 | - |
 | CVC-14 | MR^-2 | 23.1 | 12.3 |
 | KAIST | MR^-2 | 23.92 | - |
-其他SOTA方法的结果文件：[SOTA](https://drive.google.com/file/d/1R-X_KsVxttoID0Q0HnCcBpNNUwb8-tDi/view?usp=drive_link)
+
+other SOTA results file: [SOTA](https://drive.google.com/file/d/1R-X_KsVxttoID0Q0HnCcBpNNUwb8-tDi/view?usp=drive_link)
 ## Acknowledgements
 Built on PaddleDetection with RT-DETR / DINO components. Thanks to the open-source community.
 
