@@ -135,13 +135,6 @@ export CUDA_VISIBLE_DEVICES=0
 python tools/train.py -c configs/DA-DPDETR/damsdet_r_paired_DAOD_r50vd_6x.yml --eval
 ```
 
-多卡训练：
-```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-python -m paddle.distributed.launch --gpus 0,1,2,3 \
-  tools/train.py -c configs/DA-DPDETR/damsdet_r_paired_DAOD_r50vd_6x.yml --fleet --eval
-```
-
 评估：
 ```bash
 python tools/eval.py -c configs/DA-DPDETR/damsdet_r_paired_DAOD_r50vd_6x.yml \
