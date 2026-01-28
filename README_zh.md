@@ -1,4 +1,5 @@
-# DOD-SA
+# DOD-SA: Infrared-Visible Decoupled Object Detection with Single-Modality Annotations
+![图片1](https://github.com/user-attachments/assets/18110be6-54ef-4b8f-b050-a1b9df6bfaf5)
 
 中文 | [English](README.md)
 
