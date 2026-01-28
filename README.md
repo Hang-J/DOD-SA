@@ -49,6 +49,9 @@ pip install -e .
 [KAIST Dataset (Google Drive)](https://drive.google.com/file/d/1vI82_bOGS82vvtn9zroNs6v7yGfg18nY/view?usp=drive_link)
 ### HBB (KAIST / FLIR / CVC-14) — this repo
 Dataset config: `configs/datasets/coco_detection_kaist_paired.yml`, which contains **KAIST / FLIR / CVC-14** blocks.
+### Download pretrain weights
+[ResNet50_pretrain_weights (Google Drive)](https://drive.google.com/file/d/1fvGWHRctR8q1LOrjQppp564xCmUw9qjz/view?usp=drive_link)
+[RTDETR_pretrain_weights (Google Drive)](https://drive.google.com/file/d/1_evLYQ8OSCDbBOTDcalUNzVRixSAVEZ1/view?usp=drive_link)
 
 **Steps:**
 1. Open `configs/datasets/coco_detection_kaist_paired.yml`.
@@ -194,7 +197,7 @@ Fill in your results here:
 | FLIR | mAP | 85.2 | - |
 | CVC-14 | MR^-2 | 23.1 | 12.3 |
 | KAIST | MR^-2 | 23.92 | - |
-
+其他SOTA方法的结果文件：[SOTA](https://drive.google.com/file/d/1R-X_KsVxttoID0Q0HnCcBpNNUwb8-tDi/view?usp=drive_link)
 ## Acknowledgements
 Built on PaddleDetection with RT-DETR / DINO components. Thanks to the open-source community.
 
