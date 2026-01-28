@@ -53,6 +53,11 @@ pip install -e .
 
 
 ## Data Preparation
+### Download Datasets
+[DroneVehicle Dataset (Google Drive)](https://drive.google.com/uc?export=download&id=1pxFaB7aLqi5Wy1ymzbiTDguuAE4U3nGu)
+[FLIR Dataset (Google Drive)](https://drive.google.com/uc?export=download&id=1pxFaB7aLqi5Wy1ymzbiTDguuAE4U3nGu)
+[CVC-14 Dataset (Google Drive)](https://drive.google.com/uc?export=download&id=1pxFaB7aLqi5Wy1ymzbiTDguuAE4U3nGu)
+[KAIST Dataset (Google Drive)](https://drive.google.com/uc?export=download&id=1pxFaB7aLqi5Wy1ymzbiTDguuAE4U3nGu)
 ### HBB (KAIST / FLIR / CVC-14) — this repo
 Dataset config: `configs/datasets/coco_detection_kaist_paired.yml`, which contains **KAIST / FLIR / CVC-14** blocks.
 
