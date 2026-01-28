@@ -199,5 +199,4 @@ python tools/infer.py -c configs/DA-DPDETR/damsdet_r_paired_DAOD_r50vd_6x.yml \
 基于 PaddleDetection，并参考 RT-DETR / DINO 相关组件。感谢开源社区。
 
 ## 许可证
-- **本仓库（HBB）**：未包含 LICENSE 文件，如需发布请补充。
-- **DroneVehicle 仓库（RBOX）**：Apache-2.0（见其 LICENSE 文件）。
+- **本仓库（HBB）**：Apache-2.0（见其 LICENSE 文件）。
