@@ -5,8 +5,8 @@
 
 本项目基于 PaddleDetection，实现了 DA-DPDETR 的配对 VIS/IR 目标检测与域自适应训练。本文档合并了两种变体：
 
-- **HBB（水平框，无角度/theta）**：适用于 **KAIST / FLIR / CVC-14**（本仓库）。
-- **RBOX（旋转框，含角度/theta）**：适用于 **DroneVehicle**（另一个仓库：`/data1/jinhang/Projects/DOD-SA/DA-DPDETR-Prominent_Poistion_Shift/DA-DPDETR`）。
+- **HBB（水平框，无角度/theta）**：适用于 **KAIST / FLIR / CVC-14**（仓库：`/data1/jinhang/Projects/DOD-SA/DA-DPDETR-Prominent_Poistion_Shift-notheta/DA-DPDETR`）。
+- **RBOX（旋转框，含角度/theta）**：适用于 **DroneVehicle**（仓库：`/data1/jinhang/Projects/DOD-SA/DA-DPDETR-Prominent_Poistion_Shift/DA-DPDETR`）。
 
 > 不要混用两种变体的配置与数据格式。HBB 与 RBOX 的数据标注与后处理不同。
 
@@ -26,19 +26,6 @@
 本项目在 PaddleDetection 上扩展了 DA-DPDETR 的训练流程，支持双流（VIS/IR）输入以及多阶段 EMA-Teacher + 伪标签训练。两种变体在 **边界框类型** 与 **数据集** 上不同：
 - **HBB**：水平框（无 theta），用于 KAIST/FLIR/CVC-14。
 - **RBOX**：旋转框（有 theta），用于 DroneVehicle。
-
-## 变体说明：HBB 与 RBOX
-### HBB（KAIST / FLIR / CVC-14）— 本仓库
-- **框类型**：HBB（水平框，无角度）。
-- **数据集**：KAIST、FLIR、CVC-14。
-- **数据集配置**：`configs/datasets/coco_detection_kaist_paired.yml`（包含三种数据集块）。
-- **Reader 配置**：`configs/DA-DPDETR/_base_/rtdetr_r_DAOD_kaist_reader.yml`。
-
-### RBOX（DroneVehicle）— DroneVehicle 仓库
-- **框类型**：RBOX（旋转框，有角度/theta）。
-- **数据集**：DroneVehicle。
-- **数据集配置**：`configs/datasets/rbox_detection_drone-vechal_paired.yml`（在 DroneVehicle 仓库中）。
-- **Reader 配置**：`configs/DA-DPDETR/_base_/rtdetr_r_DAOD_reader.yml`（在 DroneVehicle 仓库中）。
 
 ## 安装
 - Python >= 3.7
@@ -208,12 +195,12 @@ python tools/infer.py -c configs/DA-DPDETR/damsdet_r_paired_DAOD_r50vd_6x.yml \
 ## 结果
 请补充你的实验结果：
 
-| 变体 | 数据集 | 指标 | 备注 |
+| Dataset | Metric | IR | RGB |
 | --- | --- | --- | --- |
-| HBB | KAIST（paired） | mAP（HBB） | config: damsdet_r_paired_DAOD_r50vd_6x |
-| HBB | FLIR（paired） | mAP（HBB） | config: damsdet_r_paired_DAOD_r50vd_6x |
-| HBB | CVC-14（paired） | mAP（HBB） | config: damsdet_r_paired_DAOD_r50vd_6x |
-| RBOX | Drone-Vehicle（paired） | mAP（RBOX） | config: damsdet_r_paired_DAOD_r50vd_6x |
+| Drone-Vehicle | mAP50 | 80.41 | 78.87 |
+| FLIR | mAP | 85.2 | - |
+| CVC-14 | MR^-2 | 23.1 | 12.3 |
+| KAIST | MR^-2 | 23.92 | - |
 
 ## 致谢
 基于 PaddleDetection，并参考 RT-DETR / DINO 相关组件。感谢开源社区。
