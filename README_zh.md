@@ -47,6 +47,11 @@ pip install -e .
 [CVC-14 Dataset (Google Drive)](https://drive.google.com/file/d/1Lcfm-baMqW2A3pYgCogBgWv0eXwnXUaJ/view?usp=drive_link)
 
 [KAIST Dataset (Google Drive)](https://drive.google.com/file/d/1vI82_bOGS82vvtn9zroNs6v7yGfg18nY/view?usp=drive_link)
+
+### 下载预训练权重
+[ResNet50_pretrain_weights (Google Drive)](https://drive.google.com/file/d/1fvGWHRctR8q1LOrjQppp564xCmUw9qjz/view?usp=drive_link)
+[RTDETR_pretrain_weights (Google Drive)](https://drive.google.com/file/d/1_evLYQ8OSCDbBOTDcalUNzVRixSAVEZ1/view?usp=drive_link)
+
 ### HBB（KAIST / FLIR / CVC-14）— 本仓库
 数据集配置文件：`configs/datasets/coco_detection_kaist_paired.yml`，包含 **KAIST / FLIR / CVC-14** 三个数据集块。
 
@@ -195,6 +200,7 @@ python tools/infer.py -c configs/DA-DPDETR/damsdet_r_paired_DAOD_r50vd_6x.yml \
 | CVC-14 | MR^-2 | 23.1 | 12.3 |
 | KAIST | MR^-2 | 23.92 | - |
 
+其他SOTA方法的结果文件：[SOTA](https://drive.google.com/file/d/1R-X_KsVxttoID0Q0HnCcBpNNUwb8-tDi/view?usp=drive_link)
 ## 致谢
 基于 PaddleDetection，并参考 RT-DETR / DINO 相关组件。感谢开源社区。
 
