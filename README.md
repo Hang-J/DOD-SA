@@ -5,8 +5,8 @@ English | [Chinese](./README_zh.md)
 
 A PaddleDetection-based implementation of DA-DPDETR for paired VIS/IR object detection and domain-adaptive training. This document merges two variants:
 
-- **HBB (horizontal bounding boxes, no angle/theta)** for **KAIST / FLIR / CVC-14** (this repo: `DA-DPDETR-Prominent_Poistion_Shift-notheta/DA-DPDETR`).
-- **RBOX (rotated bounding boxes, with angle/theta)** for **DroneVehicle** (the DroneVehicle repo: `DA-DPDETR-Prominent_Poistion_Shift/DA-DPDETR`).
+- **HBB (horizontal bounding boxes, no angle/theta)** for **KAIST / FLIR / CVC-14** (the repo: `DA-DPDETR-Prominent_Poistion_Shift-notheta/DA-DPDETR`).
+- **RBOX (rotated bounding boxes, with angle/theta)** for **DroneVehicle** (the repo: `DA-DPDETR-Prominent_Poistion_Shift/DA-DPDETR`).
 
 > Do not mix configs or data formats between the two variants. HBB and RBOX use different dataset formats and post-processing.
 
@@ -27,19 +27,6 @@ This project extends PaddleDetection with a DA-DPDETR training pipeline. It supp
 - **HBB**: axis-aligned boxes (no theta) for KAIST/FLIR/CVC-14.
 - **RBOX**: rotated boxes (with theta) for DroneVehicle.
 
-## Variants: HBB vs. RBOX
-### HBB (KAIST / FLIR / CVC-14) — this repo
-- **BBox type**: HBB (horizontal, no angle).
-- **Datasets**: KAIST, FLIR, CVC-14.
-- **Dataset config**: `configs/datasets/coco_detection_kaist_paired.yml` (contains blocks for all three datasets).
-- **Reader config**: `configs/DA-DPDETR/_base_/rtdetr_r_DAOD_kaist_reader.yml`.
-
-### RBOX (DroneVehicle) — DroneVehicle repo
-- **BBox type**: RBOX (rotated, with angle/theta).
-- **Dataset**: DroneVehicle.
-- **Dataset config**: `configs/datasets/rbox_detection_drone-vechal_paired.yml` (in DroneVehicle repo).
-- **Reader config**: `configs/DA-DPDETR/_base_/rtdetr_r_DAOD_reader.yml` (in DroneVehicle repo).
-
 ## Installation
 - Python >= 3.7
 - PaddlePaddle >= 2.4.1
@@ -50,7 +37,6 @@ Install (make sure PaddlePaddle is installed for your CUDA version first):
 pip install -r requirements.txt
 pip install -e .
 ```
-
 
 ## Data Preparation
 ### Download Datasets
@@ -209,12 +195,12 @@ python tools/infer.py -c configs/DA-DPDETR/damsdet_r_paired_DAOD_r50vd_6x.yml \
 ## Results
 Fill in your results here:
 
-| Variant | Dataset | Metric | Notes |
+| Dataset | Metric | IR | RGB |
 | --- | --- | --- | --- |
-| HBB | KAIST (paired) | mAP (HBB) | config: damsdet_r_paired_DAOD_r50vd_6x |
-| HBB | FLIR (paired) | mAP (HBB) | config: damsdet_r_paired_DAOD_r50vd_6x |
-| HBB | CVC-14 (paired) | mAP (HBB) | config: damsdet_r_paired_DAOD_r50vd_6x |
-| RBOX | Drone-Vehicle (paired) | mAP (RBOX) | config: damsdet_r_paired_DAOD_r50vd_6x |
+| Drone-Vehicle | mAP50 | 80.41 | 78.87 |
+| FLIR | mAP | 85.2 | - |
+| CVC-14 | MR^-2 | 23.1 | 12.3 |
+| KAIST | MR^-2 | 23.92 | - |
 
 ## Acknowledgements
 Built on PaddleDetection with RT-DETR / DINO components. Thanks to the open-source community.
